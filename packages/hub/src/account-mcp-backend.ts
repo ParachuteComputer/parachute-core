@@ -240,6 +240,9 @@ export async function postVaultMcp(
 
 /** The query tools the account door fans out across vaults: 0.9's record name and its note-named alias (T-407). */
 export const FAN_OUT_TOOLS: ReadonlySet<string> = new Set(["query-records", "query-notes"]);
+/** Tools that touch no vault (T-476: `docs` reads the docs site): listed as each vault lists them, with no `vault` to
+ *  name, and answered by any vault the key covers. */
+export const VAULT_AGNOSTIC_TOOLS: ReadonlySet<string> = new Set(["docs"]);
 
 function injectVaultSelector(tool: {
   name: string;
@@ -251,17 +254,17 @@ function injectVaultSelector(tool: {
     tool.inputSchema && typeof tool.inputSchema === "object"
       ? (tool.inputSchema as Record<string, unknown>)
       : { type: "object" };
+  const agnostic = VAULT_AGNOSTIC_TOOLS.has(tool.name);
   const properties = {
     ...((rawSchema.properties && typeof rawSchema.properties === "object"
       ? rawSchema.properties
       : {}) as Record<string, unknown>),
-    vault: {
-      type: "string",
-      description: FAN_OUT_TOOLS.has(tool.name) ? VAULT_FIELD_FAN_OUT : VAULT_FIELD_REQUIRED,
-    },
+    ...(agnostic
+      ? {}
+      : { vault: { type: "string", description: FAN_OUT_TOOLS.has(tool.name) ? VAULT_FIELD_FAN_OUT : VAULT_FIELD_REQUIRED } }),
   };
   const schema: Record<string, unknown> = { ...rawSchema, properties };
-  if (!FAN_OUT_TOOLS.has(tool.name)) {
+  if (!FAN_OUT_TOOLS.has(tool.name) && !agnostic) {
     const req = Array.isArray(schema.required)
       ? schema.required.filter((x): x is string => typeof x === "string")
       : [];
@@ -453,6 +456,20 @@ export async function callVaultModuleTool(
   ctx: AccountToolContext,
 ): Promise<unknown> {
   if (FAN_OUT_TOOLS.has(name)) return queryNotesOverlay(args, ctx, name);
+  if (VAULT_AGNOSTIC_TOOLS.has(name)) {
+    // Any covered vault answers, tried in the order tools/list tries them, so the vault that listed it can answer it.
+    // A `vault` given is ignored. Every vault's docs answers alike, so a refusal (a page that isn't there) only costs a retry.
+    const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
+    let last: unknown = Object.assign(new Error("This key covers no vault."), { error_type: "no_vault" });
+    for (const v of schemaSourceCandidates(ctx, coverage.vaults)) {
+      try {
+        return await postVaultMcp(ctx, v, verbForVault(ctx, v.name), "tools/call", { name, arguments: stripVaultArg(args) });
+      } catch (e) {
+        last = e;
+      }
+    }
+    throw last;
+  }
 
   const hit = coveredVault(ctx, args.vault);
   const verb = verbForVault(ctx, hit.name);

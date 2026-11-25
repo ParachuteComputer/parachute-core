@@ -23,12 +23,13 @@ import { internalRefusal, refusalOfError, refusalResult, unknownToolRefusal, typ
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { generateScopedMcpTools, getServerInstruction, scopedProjection } from "./mcp-tools.ts";
+import { boxDocs, generateScopedMcpTools, getServerInstruction, scopedProjection } from "./mcp-tools.ts";
 import { handleModernMcp, isLegacyRequest } from "./mcp-modern.ts";
 import { vaultSkillSource } from "./mcp-skills.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import { mcpToolErrorLine } from "../core/src/mcp-error-log.ts";
+import { withRefusalDocs, withWarningDocs, type DocsContext } from "../core/src/docs-tool.ts";
 import { declaresFilesExtension, schemaForClient } from "../core/src/attachment/inline.ts";
 import { hasScopeForVault } from "./scopes.ts";
 import type { VaultVerb } from "./scopes.ts";
@@ -145,6 +146,8 @@ export function toolSurface(
   getTools: () => McpToolDef[],
   vaultName: string,
   auth: AuthResult,
+  /** Where a refusal's fix page is (T-476). Omitted: this box's own (`boxDocs`). */
+  docs: DocsContext = boxDocs(),
 ): {
   list: (meta?: unknown) => Array<{ name: string; description: string; inputSchema: Record<string, unknown>; annotations: ReturnType<typeof toolAnnotations> }>;
   call: (request: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<any>;
@@ -181,25 +184,28 @@ export function toolSurface(
     // One way to refuse (core/src/mcp-refusal.ts): every refusal is an `isError` result with `structuredContent
     // {error_type, message, ...}`, never a JSON-RPC error, on both eras' doors. A record tool's is said in its own
     // words (T-407).
-    call: async (request) => {
-      const { name, arguments: args } = request.params;
-      // Dispatch against the FILTERED tool list: a tool the caller can't see in `tools/list` can't be called either
-      // (vault#376), and the refusal is the same as for a tool that doesn't exist, so nothing leaks.
-      const tool = visibleTools.find((t) => t.name === name);
-      if (!tool) return refusalResult(unknownToolRefusal(name));
-      try {
-        // `resultContent`, when a tool defines it, decides the content blocks (read-attachment's image, the note
-        // aliases' nudge); mcpCallResult adds `structuredContent` where a client needs it (T-456), and answers a
-        // refusal a tool said as data (`{error, error_type}`) as a refusal.
-        return mcpCallResult(tool, await tool.execute((args ?? {}) as Record<string, unknown>));
-      } catch (err) {
-        const r = refusalOfError(err);
-        if (r) return refusalResult(NOTE_TOOL_NAMES[name] ? recordRefusal(r) : r);
-        // Nobody tagged this error, so it is a crash, not a refusal (audit L6-02): one server-log line, no arguments.
-        console.error(mcpToolErrorLine(name, err, pkg.version));
-        return refusalResult(internalRefusal(err));
-      }
-    },
+    // T-476: every refusal carries `docs`, the page with its fix for this version (docs-tool.ts).
+    call: async (request) => withRefusalDocs(await callTool(request), docs),
     byName: (name) => visibleTools.find((t) => t.name === name),
   };
+
+  async function callTool(request: { params: { name: string; arguments?: Record<string, unknown> } }): Promise<any> {
+    const { name, arguments: args } = request.params;
+    // Dispatch against the FILTERED tool list: a tool the caller can't see in `tools/list` can't be called either
+    // (vault#376), and the refusal is the same as for a tool that doesn't exist, so nothing leaks.
+    const tool = visibleTools.find((t) => t.name === name);
+    if (!tool) return refusalResult(unknownToolRefusal(name, level));
+    try {
+      // `resultContent`, when a tool defines it, decides the content blocks (read-attachment's image, the note
+      // aliases' nudge); mcpCallResult adds `structuredContent` where a client needs it (T-456), and answers a
+      // refusal a tool said as data (`{error, error_type}`) as a refusal.
+      return mcpCallResult(tool, withWarningDocs(await tool.execute((args ?? {}) as Record<string, unknown>), docs));
+    } catch (err) {
+      const r = refusalOfError(err);
+      if (r) return refusalResult(NOTE_TOOL_NAMES[name] ? recordRefusal(r) : r);
+      // Nobody tagged this error, so it is a crash, not a refusal (audit L6-02): one server-log line, no arguments.
+      console.error(mcpToolErrorLine(name, err, pkg.version));
+      return refusalResult(internalRefusal(err));
+    }
+  }
 }

@@ -221,6 +221,34 @@ describe("config", () => {
     expect(readGlobalConfig().discovery).toBe("disabled");
   });
 
+  test("docs.base_url (T-476): read from a hand-written block, kept when the config is written again, and the box's docs follow it", async () => {
+    const fs = require("fs");
+    const path = `${process.env.PARACHUTE_HOME}/vault/config.yaml`;
+    // as a self-hoster writes it, with a comment and quotes
+    fs.writeFileSync(path, 'port: 1940\ndocs:\n  base_url: "https://docs.example.org/parachute"  # our own copy\ndiscovery: disabled\n');
+    expect(readGlobalConfig().docs).toEqual({ base_url: "https://docs.example.org/parachute" });
+    expect(readGlobalConfig().discovery).toBe("disabled");
+    // another setting written through the program keeps it (writeGlobalConfig rewrites the whole file)
+    writeGlobalConfig({ ...readGlobalConfig(), autostart: false });
+    expect(readGlobalConfig().docs).toEqual({ base_url: "https://docs.example.org/parachute" });
+    const saved = process.env.PARACHUTE_DOCS_URL;
+    delete process.env.PARACHUTE_DOCS_URL;
+    try {
+      const { boxDocs } = await import("./mcp-tools.ts");
+      expect(boxDocs().origin).toBe("https://docs.example.org/parachute");
+      fs.writeFileSync(path, "port: 1940\ndocs:\n  base_url: off\n");
+      expect(boxDocs().origin).toBeNull();
+      // the environment wins over the file
+      process.env.PARACHUTE_DOCS_URL = "http://127.0.0.1:8080";
+      expect(boxDocs().origin).toBe("http://127.0.0.1:8080");
+    } finally {
+      if (saved === undefined) delete process.env.PARACHUTE_DOCS_URL;
+      else process.env.PARACHUTE_DOCS_URL = saved;
+    }
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().docs).toBeUndefined();
+  });
+
   test("global api_keys round-trip scope: read|write and default missing scope to write", () => {
     // Regression for the silent privilege-escalation bug: the global YAML
     // parser used to drop the `scope` field, leaving `globalKey.scope`

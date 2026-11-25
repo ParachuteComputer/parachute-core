@@ -22,6 +22,8 @@ import { describe, test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { handleMcp } from "./mcp-http.ts";
+import { docsMinor, docsPageUrl, refusalTopic } from "../core/src/docs-tool.ts";
+import pkg from "../package.json" with { type: "json" };
 import { plainMessage, refusalOfError, refusalOfReply } from "../core/src/mcp-refusal.ts";
 import { generateMcpTools, type McpToolDef } from "../core/src/mcp.ts";
 import { SqliteStore } from "../core/src/store.ts";
@@ -143,6 +145,9 @@ describe("refusalOfError — the one mapping from a thrown error to a refusal (T
   });
 });
 
+/** T-476: every refusal carries `docs`, the page with its fix for this box's version (core/src/docs-tool.ts). */
+const docsFor = (type: string) => docsPageUrl({ origin: "https://parachute.computer", version: pkg.version }, refusalTopic(type));
+
 describe("handleMcp refusals — end to end (vault#555 fix 6, T-476)", () => {
   test("a tool throwing an ALREADY-formed McpError is an isError refusal: no prefix, data preserved verbatim as fields", async () => {
     const inner = new McpError(ErrorCode.InvalidRequest, "conflict: note was modified", {
@@ -162,6 +167,7 @@ describe("handleMcp refusals — end to end (vault#555 fix 6, T-476)", () => {
       message: "conflict: note was modified",
       note_id: "abc123",
       hint: "re-read and retry",
+      docs: docsFor("conflict"),
     });
     expect(JSON.parse(body.result.content[0].text)).toEqual(body.result.structuredContent);
   });
@@ -193,7 +199,7 @@ describe("handleMcp refusals — end to end (vault#555 fix 6, T-476)", () => {
     const body = await callBoom(() => ({ error: "Note not found", error_type: "not_found", id: "n1" }));
     expect(body.error).toBeUndefined();
     expect(body.result.isError).toBe(true);
-    expect(body.result.structuredContent).toEqual({ error_type: "not_found", message: "Note not found", id: "n1" });
+    expect(body.result.structuredContent).toEqual({ error_type: "not_found", message: "Note not found", id: "n1", docs: docsFor("not_found") });
   });
 
   test("a truly unknown error (no error_type anywhere) is an internal_error refusal, not a thrown McpError", async () => {
@@ -202,7 +208,7 @@ describe("handleMcp refusals — end to end (vault#555 fix 6, T-476)", () => {
     });
     expect(body.error).toBeUndefined();
     expect(body.result.isError).toBe(true);
-    expect(body.result.structuredContent).toEqual({ error_type: "internal_error", message: "Error: plain unstructured failure" });
+    expect(body.result.structuredContent).toEqual({ error_type: "internal_error", message: "Error: plain unstructured failure", docs: docsFor("internal_error") });
     expect(body.result.content[0].text).toContain("plain unstructured failure");
   });
 
@@ -214,7 +220,13 @@ describe("handleMcp refusals — end to end (vault#555 fix 6, T-476)", () => {
     });
     const body: any = await (await handleMcp(req, toolsWith(() => ({})), "test-server", "v", fullAuth(), "")).json();
     expect(body.result.isError).toBe(true);
-    expect(body.result.structuredContent).toEqual({ error_type: "unknown_tool", message: "Unknown tool: nope", tool: "nope" });
+    expect(body.result.structuredContent).toEqual({
+      error_type: "unknown_tool",
+      // T-476: the caller's own level, the same words whether the tool exists above it or not at all
+      message: "Unknown tool: nope. tools/list names every tool this connection has.",
+      tool: "nope",
+      docs: "https://parachute.computer/docs/v/" + docsMinor(pkg.version) + "/fix/needs-admin/",
+    });
   });
 });
 

@@ -13,7 +13,7 @@
  *   readOnlyHint     no call changes the vault
  *   destructiveHint  (changes only) a call can overwrite or remove what was there
  *   idempotentHint   (changes only) the same call again changes nothing more
- *   openWorldHint    false everywhere: a tool reaches this vault only
+ *   openWorldHint    false but for `docs`: a tool reaches this vault only (`docs` reads the docs site, nothing of the vault)
  *
  * Every vault tool a door lists is here; a contract checks every listed tool carries all four. The account door's
  * own five (list-vaults …) carry theirs where they are defined (packages/hub/src/account-mcp.ts).
@@ -44,6 +44,7 @@ export const TOOL_ANNOTATIONS: Readonly<Record<string, McpToolAnnotations>> = {
   doctor: READ,
   "read-attachment": READ,
   "find-path": READ,
+  docs: { ...READ, openWorldHint: true }, // reads the docs site (T-476)
   "request-attachment-download": READ, // mints a one-use download URL for bytes the caller can already read
   // Changes.
   "create-record": CHANGE, // if_exists: "update" | "replace" overwrite

@@ -7747,9 +7747,10 @@ describe("stateless MCP transport", async () => {
     expect(toolNames).toContain("request-attachment-download");
     expect(toolNames).not.toContain("request-attachment-upload");
     expect(toolNames).toContain("read-attachment");
-    // Read tier: 6 tools in the eleven-tool shape (T-318 §4) plus the four
+    // Read tier: 7 tools in the eleven-tool shape (T-318 §4; T-476 docs) plus the four
     // read-tier aliases (query-notes, list-tags, find-path, request-attachment-download).
-    expect(toolNames.length).toBe(10);
+    expect(toolNames).toContain("docs");
+    expect(toolNames.length).toBe(11);
     // T-407: the mutation tools are hidden under their record names too.
     expect(toolNames).toContain("query-records");
     expect(toolNames).not.toContain("create-record");
@@ -8234,12 +8235,13 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
 
   // T-318 §4: the eleven-tool shape, then the old names still listed as aliases through 0.9.
   // T-407: the record tools lead; the note-named tools follow as aliases through 0.9.
-  test("vault:read sees the 6 read tools, then the read-tier aliases (query-notes, list-tags, find-path, request-attachment-download)", async () => {
+  test("vault:read sees the 7 read tools, then the read-tier aliases (query-notes, list-tags, find-path, request-attachment-download)", async () => {
     const names = await listToolNames(["vault:read"]);
     expect(names).toEqual([
       "query-records",
       "list-types",
       "vault-info",
+      "docs", // T-476: Parachute's docs for this version, at every level
       "doctor",
       "read-attachment",
       "attachment-url",
@@ -8250,7 +8252,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     ]);
   });
 
-  test("vault:read + vault:write sees the 11 writer tools, then the aliases a writer may call", async () => {
+  test("vault:read + vault:write sees the 12 writer tools, then the aliases a writer may call", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
     expect(names).toEqual([
       "query-records",
@@ -8259,6 +8261,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
       "delete-record",
       "list-types",
       "vault-info",
+      "docs", // T-476: Parachute's docs for this version, at every level
       "doctor",
       "read-attachment",
       "add-attachment", // T-476: a file sent in the call
@@ -8285,7 +8288,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("delete-note");
   });
 
-  test("vault:admin sees all 26 (12 tools + 14 aliases) including manage-token + prune-schema + the tag-schema tools + all four attachment tools", async () => {
+  test("vault:admin sees all 27 (13 tools + 14 aliases) including manage-token + prune-schema + the tag-schema tools + all four attachment tools", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
@@ -8300,10 +8303,11 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("add-attachment");
     expect(names).toContain("manage-types");
     expect(names).toContain("manage-keys");
-    expect(names.length).toBe(26); // 12 tools + 14 aliases (T-407: the five note-named tools; T-476: add-attachment)
+    expect(names).toContain("docs");
+    expect(names.length).toBe(27); // 13 tools + 14 aliases (T-407: the five note-named tools; T-476: add-attachment, docs)
   });
 
-  test("legacy-derived full token sees all 26 (back-compat)", async () => {
+  test("legacy-derived full token sees all 27 (back-compat)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -8336,7 +8340,8 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     } as any);
     const body = await res.json() as any;
     const names: string[] = body.result.tools.map((t: any) => t.name);
-    expect(names.length).toBe(26); // 12 tools + 14 aliases (T-407: the five note-named tools; T-476: add-attachment)
+    expect(names).toContain("docs");
+    expect(names.length).toBe(27); // 13 tools + 14 aliases (T-407: the five note-named tools; T-476: add-attachment, docs)
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
     expect(names).toContain("doctor");

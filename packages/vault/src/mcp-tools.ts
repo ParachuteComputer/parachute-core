@@ -6,6 +6,8 @@
  */
 
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
+import { docsOrigin, latestRelease, newerRelease, type DocsContext } from "../core/src/docs-tool.ts";
+import pkg from "../package.json" with { type: "json" };
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
@@ -135,6 +137,11 @@ export async function getServerInstruction(
     attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url", addEnabled: !auth || hasScopeForVault(auth.scopes, vaultName, "write") },
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
+    // T-476: the docs for this version; "X is out" from the site's /latest.json as last read (never waited on).
+    docs: (() => {
+      const d = boxDocs();
+      return d.origin === null ? null : { origin: d.origin, version: d.version, newer: newerRelease(d.version, latestRelease(d.origin).value) };
+    })(),
     // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
     ...(auth
       ? {
@@ -145,6 +152,14 @@ export async function getServerInstruction(
         }
       : {}),
   });
+}
+
+/**
+ * Where this box's docs are and which version they're for (T-476, core/src/docs-tool.ts): PARACHUTE_DOCS_URL, else
+ * `docs.base_url` in the vault config, else parachute.computer; `off` in either is no docs. The version is core's.
+ */
+export function boxDocs(): DocsContext {
+  return { origin: docsOrigin(process.env.PARACHUTE_DOCS_URL, readGlobalConfig().docs?.base_url), version: pkg.version };
 }
 
 /**
@@ -402,6 +417,10 @@ export function generateScopedMcpTools(
         }
       : {}),
     doorTool: (name) => (name === "manage-token" || name === "manage-keys" ? { ...manageTokenReference(vaultName), name } : undefined),
+    docs: (() => {
+      const d = boxDocs();
+      return d.origin === null ? null : { origin: d.origin, version: d.version };
+    })(),
   });
   applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 

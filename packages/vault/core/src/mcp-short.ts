@@ -462,12 +462,12 @@ export const TOOL_ALIASES: Record<string, string> = {
 
 /** An alias's description: the one deprecation line, then nothing else (the schema stays as it was). */
 export function aliasDescription(tool: string): string {
-  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}. Same parameters as before.`;
+  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}.`;
 }
 
 /** The order tools/list sends: the eleven (record tools first, T-407), then the aliases, note-named ones first. */
 export const TOOL_ORDER = [
-  "query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor",
+  "query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "docs", "doctor",
   "read-attachment", "add-attachment", "attachment-url", "manage-types", "manage-keys",
   "query-notes", "create-note", "update-note", "delete-note", "list-tags",
   ...Object.keys(TOOL_ALIASES),

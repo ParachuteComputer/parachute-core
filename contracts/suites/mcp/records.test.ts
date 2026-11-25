@@ -157,7 +157,7 @@ describe("mcp/records", () => {
       expect(names.indexOf(fresh)).toBeGreaterThanOrEqual(0);
       expect(names.indexOf(old)).toBeGreaterThan(names.indexOf(fresh));
       const alias = tools.find((t) => t.name === old)!;
-      expect(alias.description).toBe(`Deprecated (gone in 1.0): use ${fresh}. Same parameters as before.`);
+      expect(alias.description).toBe(`Deprecated (gone in 1.0): use ${fresh}.`);
       // A 0.8 client still sees the parameters it knows (names and types; the descriptions moved to the record tool).
       if (old !== "list-tags") expect(Object.keys(alias.inputSchema.properties ?? {})).toContain(old === "delete-note" ? "id" : old === "query-notes" ? "include_content" : "content");
     }

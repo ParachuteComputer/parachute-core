@@ -33,6 +33,7 @@ import {
 } from "./tag-schemas.ts";
 import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
+import { docsBriefLine } from "./docs-tool.ts";
 import type { VaultStats, VaultMap } from "./types.ts";
 import { GETTING_STARTED_PATH } from "./seed-packs.ts";
 import { SKILL_TYPE } from "./skills.ts";
@@ -426,6 +427,9 @@ export function projectionToMarkdown(args: {
    * (`parachute auth mint-token`). A door without that command (cloud: keys are made in the account) says its own.
    */
   scripting?: string;
+  /** Where the docs are, the version this door runs and a newer release if the site says so (T-476, docs-tool.ts):
+   *  a "## Docs" section naming the `docs` tool. Omitted or `null`: no section (a door that lists no `docs` tool). */
+  docs?: { origin: string; version: string; newer?: string | null } | null;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
   const w = args.words ?? ((s: string) => s);
@@ -465,6 +469,14 @@ export function projectionToMarkdown(args: {
       );
       lines.push(`- MCP endpoint: \`<hub-origin>/vault/${vaultName}/mcp\``);
     }
+  }
+
+  // T-476: the docs for this version, and where a refusal's fix is. One line: the tool says the rest.
+  if (args.docs) {
+    lines.push("");
+    lines.push("## Docs");
+    lines.push("");
+    lines.push(docsBriefLine(args.docs));
   }
 
   // A2: surface the seeded onboarding guide so a connected AI can discover it
@@ -598,7 +610,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push(
     args.scripting ??
-      `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
+      `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/docs/build/scripts/`,
   );
 
   return lines.join("\n");

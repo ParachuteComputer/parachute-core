@@ -126,7 +126,7 @@ describe("addRecordTools", () => {
     expect(tools.map((t) => t.name)).toEqual(["query-records", "vault-info", "query-notes"]);
     expect(await tools[0]!.execute({ [`include_${BODY}`]: true })).toEqual([{ id: "1", [BODY]: "x", [FIELDS]: {} }]);
     expect(seen[0]).toEqual({ include_content: true });
-    expect(tools[2]!.description).toBe("Deprecated (gone in 1.0): use query-records. Same parameters as before.");
+    expect(tools[2]!.description).toBe("Deprecated (gone in 1.0): use query-records.");
     expect(await tools[2]!.execute({ include_content: true })).toEqual([{ id: "1", content: "x", metadata: {} }]);
     expect(used).toEqual(["new:query-records", "old:query-notes"]);
   });
