@@ -24,6 +24,7 @@
 
 import { BODY, FIELDS } from "./mcp-records.js";
 import { HYBRID_TEXT } from "./hybrid.js";
+import { FILE_INPUT, MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.js";
 
 type Schema = Record<string, unknown>;
 
@@ -242,6 +243,18 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
     ),
   },
 
+  "add-attachment": {
+    description: `Store a file on a record, its bytes in the call: \`file.data\` base64, \`file.digest\` its SHA-256, \`file.size\` bytes. Up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB, else attachment-url. ${HELP("add-attachment")}`,
+    inputSchema: obj(
+      {
+        record: str("Id or path"),
+        file: FILE_INPUT,
+        transcribe: bool(),
+      },
+      ["record", "file"],
+    ),
+  },
+
   "request-attachment-download": {
     description: "A one-use download URL for an attachment. Ids come from query-notes with `include_attachments: true`.",
     inputSchema: obj({ attachment_id: str() }, ["attachment_id"]),
@@ -272,6 +285,7 @@ const PARAM_ALIASES: Record<string, Record<string, string>> = {
   "request-attachment-upload": { note_id: "note", id: "note", size: "size_bytes", name: "filename" },
   "request-attachment-download": { id: "attachment_id" },
   "read-attachment": { id: "attachment_id" },
+  "add-attachment": { note: "record", note_id: "record", record_id: "record", id: "record", attachment: "file", bytes: "file", content: "file", data: "file" },
 };
 
 /** Nested misuses worth one line each: `[tool, param, wrong key, right key]`. */
@@ -328,6 +342,7 @@ export const REFUSES_UNKNOWN_PARAMS: ReadonlySet<string> = new Set([
   "list-types",
   "manage-types",
   "attachment-url",
+  "add-attachment",
   "manage-keys",
 ]);
 
@@ -453,7 +468,7 @@ export function aliasDescription(tool: string): string {
 /** The order tools/list sends: the eleven (record tools first, T-407), then the aliases, note-named ones first. */
 export const TOOL_ORDER = [
   "query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor",
-  "read-attachment", "attachment-url", "manage-types", "manage-keys",
+  "read-attachment", "add-attachment", "attachment-url", "manage-types", "manage-keys",
   "query-notes", "create-note", "update-note", "delete-note", "list-tags",
   ...Object.keys(TOOL_ALIASES),
 ];

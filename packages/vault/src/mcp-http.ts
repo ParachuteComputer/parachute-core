@@ -31,6 +31,7 @@ import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import { mcpToolErrorLine } from "../core/src/mcp-error-log.ts";
+import { declaresFilesExtension, schemaForClient } from "../core/src/attachment/inline.ts";
 import { hasScopeForVault } from "./scopes.ts";
 import type { VaultVerb } from "./scopes.ts";
 import pkg from "../package.json" with { type: "json" };
@@ -168,11 +169,12 @@ export async function handleMcp(
   // can't set the vault-wide description, so for the hints it counts as a writer.
   const tagScoped = (auth.scoped_tags?.length ?? 0) > 0;
   const level = hasScopeForVault(auth.scopes, vaultName, "admin") && !tagScoped ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  server.setRequestHandler(ListToolsRequestSchema, async (request) => ({
     tools: visibleTools.map((t) => ({
       name: t.name,
       description: t.description,
-      inputSchema: t.inputSchema,
+      // T-476: a file argument is marked `x-mcp-file` only for a client that declared the file-transfer extension.
+      inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(request.params?._meta)),
       annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
     })),
   }));

@@ -47,6 +47,22 @@ export const BLOCKED_ATTACHMENT_EXTENSIONS = new Set([
   ".css",
 ]);
 
+/**
+ * The browser-active media types, each with the blocked extension it stands for. A file that arrives with a type but
+ * no name (`add-attachment`, T-476) is checked by its type: `text/html` with no name is refused as `.html` would be.
+ */
+export const BLOCKED_ATTACHMENT_MIME_EXTENSIONS: Readonly<Record<string, string>> = {
+  "text/html": ".html",
+  "application/xhtml+xml": ".xhtml",
+  "image/svg+xml": ".svg",
+  "text/xml": ".xml",
+  "application/xml": ".xml",
+  "text/javascript": ".js",
+  "application/javascript": ".js",
+  "application/x-javascript": ".js",
+  "text/css": ".css",
+};
+
 // Explicit MIME types for the commonly-previewed formats. Anything accepted
 // but absent here serves as application/octet-stream — a download, never
 // rendered (e.g. .pages/.key/.numbers/.azw3/.exe/arbitrary binaries). None of
