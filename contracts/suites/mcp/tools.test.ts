@@ -38,7 +38,7 @@ describe("mcp/tools", () => {
     const a = runId("kind");
     const field = runId("f").replace(/-/g, "_"); // field names are vault-wide: never reuse another suite's
     await c.call("manage-types", { tag: a, fields: { [field]: { type: "string" } } });
-    const gone = async (name: string) => (await c.call("list-tags", { tag: name })).error_type === "tag_not_found";
+    const gone = async (name: string) => (await c.refused("list-tags", { tag: name }))?.error_type === "tag_not_found";
     const renamed = await c.call("manage-types", { action: "rename", old_name: a, new_name: `${a}-x` });
     expect(renamed.deprecation).toBeUndefined();
     expect(await gone(a)).toBe(true);

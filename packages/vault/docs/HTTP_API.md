@@ -561,8 +561,8 @@ the existing `error`/`code`:
 }
 ```
 
-The MCP `query-notes` tool call surfaces the identical `error_type` (via a
-structured JSON-RPC error) for the same cases — see the tool description
+The MCP `query-notes` tool call surfaces the identical `error_type` (as an
+`isError` refusal, "MCP refusals" below) for the same cases — see the tool description
 for `limit`/`offset`/`date_filter`/`search_mode`.
 
 **Structured invalids (400, `error_type: "invalid_search_syntax"`, vault#551).**
@@ -609,13 +609,13 @@ is rewritten for this specific pattern instead of forwarding it verbatim:
 }
 ```
 
-The MCP `query-notes` tool call surfaces the identical `error_type` (via a
-structured JSON-RPC error, `src/mcp-http.ts`).
+The MCP `query-notes` tool call surfaces the identical `error_type` (as an
+`isError` refusal, "MCP refusals" below).
 
 ## Error taxonomy — `error_type` contract table (vault#554, Wave 4)
 
 Every error body an agent or client can receive — REST 4xx/5xx JSON and MCP
-JSON-RPC error `data` — carries a stable `error_type` string, additive to
+refusal's `structuredContent` — carries a stable `error_type` string, additive to
 whatever transport-specific fields already existed (`error`, `code`, HTTP
 status). Structured fields beyond `error_type` follow one vocabulary:
 `field` (which input), `expected`/`got` (what was wrong), `hint` (how to
@@ -624,27 +624,34 @@ fix it), plus error-specific extras (`violations`, `candidates`, ...).
 for humans and may be reworded across releases; `error_type` strings and
 HTTP statuses are wire contract and do not change without a migration.
 
-On MCP, every error below arrives as a JSON-RPC error whose `data` field
-carries the same shape (`src/mcp-http.ts`'s domain-error mapping); on REST,
-as the JSON response body at the listed HTTP status. Where a row lists two
-statuses, REST and MCP intentionally differ only in HTTP-status framing —
-the `error_type` and fields are identical.
+On REST, every error below arrives as the JSON response body at the listed HTTP status; on MCP, as a refusal
+(below) with the same `error_type` and fields. Where a row lists two statuses, REST and MCP intentionally differ only
+in HTTP-status framing.
 
-**MCP human-readable `message` (vault#555 fix 6).** The JSON-RPC `error.message`
-string now ALSO carries the `error_type` token — `"MCP error -32602:
-[schema_validation] schema_validation: 1 strict field violation(s) — ..."`
-— so a string-reading human sees which structured category an error
-belongs to without parsing `data`. (`data.error_type` was always correct;
-this only improves the prose.) This also fixed a real bug: `mcp-http.ts`'s
-domain-error mapping used to read the caught error's `.message` and feed it
-into a fresh `McpError` — the MCP SDK's `McpError` constructor bakes `"MCP
-error <code>: "` into `.message` itself, so an already-formed `McpError`
-(or a message that already carried that prefix) got double-prefixed
-(`"MCP error -32602: MCP error -32602: ..."`). Every domain error is now
-mapped through one function (`mcpDomainError`) that strips a pre-existing
-prefix before adding its own, and an already-formed `McpError` is re-thrown
-unchanged rather than re-wrapped. `data.error_type` fidelity was never
-actually affected by the bug — only the message string could double.
+### MCP refusals: one shape (T-476)
+
+Every refusal of a `tools/call`, on the vault door (`/vault/<name>/mcp`) and the account door (`/account/mcp`, `/mcp`),
+is a normal JSON-RPC result:
+
+```json
+{ "isError": true,
+  "structuredContent": { "error_type": "conflict", "message": "…", "current_updated_at": "…", "record_id": "…", "hint": "…" },
+  "content": [{ "type": "text", "text": "<the same object as JSON>" }] }
+```
+
+- `error_type`: what to branch on (the table below; plus `unknown_tool` for a tool that doesn't exist or isn't offered
+  at the caller's level, and `internal_error` for a crash).
+- `message`: words for a person. It no longer starts with `[error_type]`.
+- every other field the refusal carries, as listed below.
+
+Only the protocol's own errors (bad JSON, an unknown method) are JSON-RPC errors.
+
+**Before this change (core #161, T-476; a meaning change for clients).** A refusal came three ways: a JSON-RPC error with `data.error_type`
+(conflicts, bad queries, schema refusals; `error.message` read `MCP error -32602: [error_type] …`), a normal reply
+whose JSON was `{error, error_type}` (a missing note or tag, a tag-scope refusal, manage-keys' refusals), or an
+`isError` result of bare text (`Unknown tool: x`). A client that reads both: when `result.isError`, read
+`result.structuredContent.error_type` (and `message`); else when there is a JSON-RPC `error`, read
+`error.data.error_type`. A reply's own `error` key is gone from refusals (its words are `message`).
 
 ### Write-path conflicts (optimistic concurrency, path, schema)
 
@@ -1644,7 +1651,7 @@ Imported history appears in existing version lists with `origin: "git-import"` a
 
 `GET /vault/{name}/api/notes/{idOrPath}/imports/{import_ix}` reads a retained imported observation. Paths use the same URL encoding and tag-scope checks as `/versions/{version_ix}`. Restore uses the existing POST `/notes/{idOrPath}/restore` with `{ "origin": "git-import", "import_ix": 0 }` and requires `if_updated_at` when the note currently exists (omit it for deleted-note recovery). `restored_from` is that reference object for imports. Native `{version_ix}` remains unchanged. Mixed, incomplete, negative, fractional or unsafe selectors are rejected. Pruned imports return 404 with their public reference; unrecoverable imports return 409 `history_unrecoverable` with the reference, never an internal storage index.
 
-MCP `query-notes` accepts `versions: {note_id, origin:"git-import", import_ix:0}` for reads. It preserves existing live-note and tag-scope restrictions. Corrupt imported content produces a JSON-RPC error with `error.data.error_type`, `origin`, and `import_ix`; it is not a successful tool result containing an error string. There is no new MCP restore operation.
+MCP `query-notes` accepts `versions: {note_id, origin:"git-import", import_ix:0}` for reads. It preserves existing live-note and tag-scope restrictions. Corrupt imported content produces an `isError` refusal whose `structuredContent` carries `error_type`, `origin`, and `import_ix`; it is not a successful tool result. There is no new MCP restore operation.
 
 The hosted door reads imported history with these same shapes. It never reads a git archive itself: the archive is imported on a self-hosted copy with `parachute-vault history-import`, and an operator then sends the result behind the notes of the person's Cloud vault (parachute-cloud `HISTORY.md`, "Operator history import"). Retention on the hosted door is parachute-cloud's to state (its `HISTORY.md`).
 
@@ -2406,7 +2413,7 @@ itself `indexed: true` (that combination already returned 400 before
 vault#554 via the indexed-field engine's cross-declarer check, and keeps
 doing so — only the previously-silent cases, non-indexed type conflicts
 and indexed-flag conflicts, are the new 422). The MCP `update-tag` tool
-reports the same split via structured JSON-RPC errors.
+reports the same split via `isError` refusals.
 
 **Tag-scope generalization (both error shapes).** For a tag-scoped
 session, the write is still rejected when the conflict is with an
@@ -2501,7 +2508,7 @@ class heuristically after the fact.
 **MCP parity (vault#552).** Exposed as the `rename-tag` MCP tool —
 `{ old_name (aliases: from, tag), new_name (alias: to) }` — delegating to
 the SAME `store.renameTag` this endpoint calls; same cascade, same error
-shapes (`tag_not_found` / `target_exists` as structured JSON-RPC errors).
+shapes (`tag_not_found` / `target_exists` as `isError` refusals).
 Tag-scoped callers: both `old_name` and `new_name` must be in the caller's
 allowlist.
 
@@ -3034,11 +3041,10 @@ extension (`io.modelcontextprotocol/files`, draft):
   hand needs the check. A model types about 4 KiB a minute, so an 80 KiB
   file is a call of about 20 minutes; with network, `attachment-url` is
   faster for anything but a small file.
-- Refusals take this vault's usual shape, a JSON-RPC error with
-  `data.error_type`, like every other tool's. The extension asks for a tool
-  result with `isError: true` for a failed size, digest or quota check; a
-  client written to it reads these from the error instead. Which shape 1.0
-  keeps is open (the T-476 proposal).
+- Refusals take every tool's shape (MCP refusals, above): a tool result with
+  `isError: true` and `structuredContent {error_type, message, ...}`
+  (`digest_mismatch`, `size_mismatch`, `inline_too_large`, ...), as the
+  extension asks for a failed size, digest or quota check.
 - The account door (`/account/mcp`) doesn't list it, so an AI stores a file
   through the vault it is connected to (the writer's tool list there keeps
   the 4,000-token budget). A call naming it there still reaches the vault,

@@ -141,7 +141,10 @@ describe("skills over MCP (T-476)", () => {
     expect(names).toContain("query-records");
     expect(names).not.toContain("create-record");
     const made = await modern("tools/call", { name: "create-record", arguments: { path: "X/y", body: "no" } }, read);
-    expect(made.result?.isError === true || made.error !== undefined).toBe(true);
+    // one way to refuse: the same isError result as the 2025 door, never a JSON-RPC error
+    expect(made.error).toBeUndefined();
+    expect(made.result?.isError).toBe(true);
+    expect(made.result?.structuredContent?.error_type).toBe("unknown_tool");
   });
 
   test("on the 2026-07-28 door a file argument is marked x-mcp-file only for a client that declares the extension", async () => {

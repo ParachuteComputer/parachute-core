@@ -42,7 +42,8 @@ async function rpc(vault: string, method: string, params: Record<string, unknown
 async function add(vault: string, args: Record<string, unknown>, a = auth(WRITE)): Promise<any> {
   const body = await rpc(vault, "tools/call", { name: "add-attachment", arguments: args }, a);
   if (body.error) return { refused: { code: body.error.code, ...(body.error.data ?? {}), message: body.error.message } };
-  if (body.result?.isError) return { refused: { message: body.result.content?.[0]?.text } };
+  // one way to refuse (core/src/mcp-refusal.ts): an isError result whose structuredContent is {error_type, message, ...}
+  if (body.result?.isError) return { refused: { ...(body.result.structuredContent ?? {}), message: body.result.structuredContent?.message ?? body.result.content?.[0]?.text } };
   return JSON.parse(body.result.content[0].text);
 }
 

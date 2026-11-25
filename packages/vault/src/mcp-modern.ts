@@ -12,15 +12,12 @@
  * (`legacy: "stateless"`) and the 1.x wiring goes, one server for both eras (T-476 subtract line, by 12-18).
  */
 
-import { createMcpHandler, isLegacyRequest, McpServer, ProtocolError } from "@modelcontextprotocol/server";
+import { createMcpHandler, isLegacyRequest, McpServer } from "@modelcontextprotocol/server";
 import { SkillsExtension, type SkillSource } from "@modelcontextprotocol/server/ext/skills";
-import { McpError } from "@modelcontextprotocol/sdk/types.js";
 import pkg from "../package.json" with { type: "json" };
 import type { toolSurface } from "./mcp-http.ts";
 
 export { isLegacyRequest };
-
-const MCP_ERROR_PREFIX_RE = /^MCP error -?\d+:\s*/;
 
 export interface ModernDoor {
   serverName: string;
@@ -53,19 +50,14 @@ function modernHandler(): ReturnType<typeof createMcpHandler> {
       mcp.server.setRequestHandler("tools/list", async (_request, ctx) => ({
         tools: door.tools.list(ctx.mcpReq.envelope) as never,
       }));
-      mcp.server.setRequestHandler("tools/call", async (request) => {
-        try {
-          const result = await door.tools.call({
-            params: request.params as { name: string; arguments?: Record<string, unknown> },
-          });
-          return mcp.server.projectCallToolResult(result, undefined);
-        } catch (err) {
-          // The tool layer throws SDK 1.x errors (domain refusals with `data.error_type`); say them in v2's type so the
-          // code and data reach the client as they do on the 2025 path.
-          if (err instanceof McpError) throw new ProtocolError(err.code, err.message.replace(MCP_ERROR_PREFIX_RE, ""), err.data);
-          throw err;
-        }
-      });
+      // One way to refuse (core/src/mcp-refusal.ts): the tool layer answers every refusal as an `isError` result with
+      // `structuredContent {error_type, message, ...}` and throws none, so this era says them exactly as the 2025 one.
+      mcp.server.setRequestHandler("tools/call", async (request) =>
+        mcp.server.projectCallToolResult(
+          await door.tools.call({ params: request.params as { name: string; arguments?: Record<string, unknown> } }),
+          undefined,
+        ),
+      );
       new SkillsExtension({ source: door.skills }).attach(mcp);
       return mcp;
     },

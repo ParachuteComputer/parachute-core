@@ -304,7 +304,8 @@
       "keys": [
         "has/multi-vault-door",
         "multivault/*",
-        "annotations/account.*"
+        "annotations/account.*",
+        "refusals/account.*"
       ],
       "between": [
         "box",

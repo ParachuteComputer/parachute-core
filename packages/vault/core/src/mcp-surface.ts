@@ -374,6 +374,8 @@ function withParamWarnings(tool: string, result: unknown, unknown: ParamProblem[
 }
 
 /**
+ * Before one way to refuse (T-476, core/src/mcp-refusal.ts) a refusal went out as a JSON-RPC error; this is its message,
+ * kept for a door that hasn't moved yet (Cloud's, until its engine pin passes T-476).
  * A refusal's JSON-RPC message names its kind, `[error_type] message` (vault#555), so a person reading only the text
  * knows which kind of refusal it is; the kind is also `data.error_type`, which an app reads.
  */

@@ -179,7 +179,7 @@ for (const corruption of ["missing", "unknown", "checksum"]) {
     expect(get.status).toBe(409);
     expect(get.body.error_type).toBe("history_unrecoverable");
     expect(get.body.hint).toContain("delta");
-    // P13(h): exercise the actual JSON-RPC error mapper, not just tool.execute.
+    // P13(h): exercise the door's refusal mapper, not just tool.execute.
     const auth = { permission: "full" as const, scopes: ["vault:compact:read"], legacyDerived: false, scoped_tags: null, vault_name: null, caller_jti: null, actor: "tester", via: "api" };
     const request = new Request("http://localhost/vault/compact/mcp", {
       method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
@@ -187,9 +187,10 @@ for (const corruption of ["missing", "unknown", "checksum"]) {
     });
     const response = await handleMcp(request, () => generateScopedMcpTools("compact", auth), "compact-test", "compact", auth, "");
     const rpc = await response.json() as any;
-    expect(rpc.error.code).toBe(-32602);
-    expect(rpc.error.data.error_type).toBe(get.body.error_type);
-    expect(rpc.result).toBeUndefined();
+    expect(rpc.error).toBeUndefined();
+    expect(rpc.result.isError).toBe(true);
+    expect(rpc.result.structuredContent.error_type).toBe(get.body.error_type);
+    expect(rpc.result.structuredContent.message).toContain("unrecoverable");
     expect((await call(`/notes/${n.id}/restore`, "POST", { version_ix: 0 })).status).toBe(409);
     expect((await call(`/notes/${n.id}/versions`)).status).toBe(200);
     if (corruption !== "checksum") {

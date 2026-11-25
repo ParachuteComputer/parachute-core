@@ -157,7 +157,8 @@ describe("files", () => {
         const r: any = await c.client.callTool({ name: "add-attachment", arguments: args }).catch((e: any) => ({ thrown: { code: e.code, message: String(e.message), data: e.data ?? null } }));
         return r;
       };
-      const refused = (r: any) => (r.thrown ? { code: r.thrown.code, type: r.thrown.data?.error_type ?? null, field: r.thrown.data?.field ?? null } : { isError: r.isError ?? false, text: String(r.content?.[0]?.text ?? "").slice(0, 80) });
+      // one way to refuse: an isError result, its error_type and field in structuredContent (a JSON-RPC error would show as thrown)
+      const refused = (r: any) => (r.thrown ? { code: r.thrown.code, type: r.thrown.data?.error_type ?? null, field: r.thrown.data?.field ?? null } : { isError: r.isError ?? false, type: r.structuredContent?.error_type ?? null, field: r.structuredContent?.field ?? null });
 
       // Copied wrong (one base64 character), the wrong size, over the cap, a record that isn't there: refused.
       const typo = file.data.slice(0, 50) + (file.data[50] === "A" ? "B" : "A") + file.data.slice(51);

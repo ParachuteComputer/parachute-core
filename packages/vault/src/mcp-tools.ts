@@ -1233,19 +1233,12 @@ function overrideVaultInfo(
   if (!vaultInfo) return;
 
   vaultInfo.execute = async (params) => {
-    // NOTE (vault#554): these two throws are deliberately left as plain,
-    // unstructured `Error`s — NOT given `error_type` — even though the rest
-    // of this file's sweep attaches one everywhere else. Attaching one here
-    // routes the throw through mcp-http.ts's structured-error mapping, which
-    // surfaces it as a JSON-RPC protocol-level error (`response.error`)
-    // instead of the in-band tool result the existing contract test asserts
-    // (`response.result.isError === true`, `response.result.content[0].text`
-    // containing the scope name) — see "tools/call of vault-info with
-    // description arg and vault:read scope is refused" in src/vault.test.ts.
-    // Changing that transport shape is out of scope for this wave.
+    // Each refusal carries its error_type: the door answers it as an isError refusal (core/src/mcp-refusal.ts), in
+    // band, as these always were (before one way to refuse, T-476, a tagged throw became a JSON-RPC error, so these
+    // were left untagged and logged as crashes).
     // `help` is answered by the 0.9 surface (core mcp-surface.ts) before this runs.
     const config = readVaultConfig(vaultName);
-    if (!config) throw new Error(`Vault "${vaultName}" not found`);
+    if (!config) throw Object.assign(new Error(`Vault "${vaultName}" not found`), { error_type: "not_found" });
 
     if (params.description !== undefined) {
       // Secondary scope check: vault-info is read-gated so read-only callers
@@ -1256,17 +1249,17 @@ function overrideVaultInfo(
       // vault:read OR vault:write token could bypass the outer gate by
       // passing `description` to a tool the outer gate considers read-only.
       if (!auth || !hasScopeForVault(auth.scopes, vaultName, "admin")) {
-        throw new Error(
+        throw Object.assign(new Error(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
-        );
+        ), { error_type: "insufficient_scope" });
       }
       // T-419 (audit L3-01): the description is vault-wide (every AI
       // connection's `initialize` carries it), so a tag-scoped admin session
       // can't set it either. Same refusal as REST PATCH /api/vault.
       if (auth.scoped_tags !== null) {
-        throw new Error(
+        throw Object.assign(new Error(
           `Forbidden: this token is restricted to tags: ${auth.scoped_tags.join(", ")}. The vault description is vault-wide and needs a token with no tag restriction.`,
-        );
+        ), { error_type: "tag_scope_violation" });
       }
       // vault#669: runtime type guard — the `as string` cast below was a
       // compile-time claim guarding nothing, so a write/admin caller could
@@ -1274,10 +1267,9 @@ function overrideVaultInfo(
       // with `description.split is not a function`) and poison the NEXT
       // MCP `initialize` (projectionToMarkdown's `description.trim()`).
       // Reject non-string/non-null here as a structured invalid-params
-      // error: a duck-typed `error_type` throw, which src/mcp-http.ts's
-      // generic branch turns into JSON-RPC -32602 INVALID_PARAMS carrying
-      // structured `data` — the same shape core's own validation leaves
-      // take, no new error family. `null` stays legal: it clears the
+      // error: a duck-typed `error_type` throw, which the door answers as an
+      // isError refusal with its fields (core/src/mcp-refusal.ts) — the
+      // same shape core's own validation leaves take, no new error family. `null` stays legal: it clears the
       // description. Cross-door parity with cloud#263 (closes the bun
       // half of cloud#87).
       if (params.description !== null && typeof params.description !== "string") {

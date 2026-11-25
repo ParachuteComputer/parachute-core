@@ -16,15 +16,20 @@
  * one object with `deprecation.notice` where it showed two blocks: the same words. Not covered (structuredContent is
  * an object, and these weren't seen to fail): arrays of notes with `content` (a batch create, a list with
  * `include_content`), and the account door's fan-out, which nests notes under `results`.
- * Pure: no imports, so the cloud runtime answers the same.
+ * A reply that is a refusal said as data (`{error, error_type}`) is answered as a refusal (mcp-refusal.ts): one way to
+ * refuse, T-476.
+ * Pure: imports only mcp-refusal.ts (pure too), so the cloud runtime answers the same.
  */
+
+import { refusalOfReply, refusalResult, type McpRefusal } from "./mcp-refusal.ts";
 
 export type McpResultBlock = { type: "text"; text: string } | { type: string; [k: string]: unknown };
 
 export interface McpCallResult {
   [k: string]: unknown; // the MCP SDK's result type is open
   content: McpResultBlock[];
-  structuredContent?: Record<string, unknown>;
+  structuredContent?: Record<string, unknown> | McpRefusal;
+  isError?: true;
 }
 
 /** A deprecated tool's notice, for `structuredContent` (the same words its second block says). */
@@ -48,6 +53,8 @@ export function readsEmptyInChatGpt(result: unknown): result is Record<string, u
 }
 
 export function mcpCallResult(tool: ResultTool, result: unknown): McpCallResult {
+  const refused = refusalOfReply(result);
+  if (refused) return refusalResult(refused);
   const content: McpResultBlock[] = tool.resultContent
     ? tool.resultContent(result)
     : [{ type: "text", text: JSON.stringify(result, null, 2) }];
