@@ -378,9 +378,9 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
  * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
  */
 export const LIVE_PAGE_BLOCK =
-  "An artifact reads with `watchTool` on `query-records`, writes on a click with `update-record` " +
-  "(`if_updated_at: record.updatedAt`), then `invalidate`s; a conflict means read again. It declares only the tools " +
-  "it calls. A reply is a record, an array, or an object with `records`; a refusal is `isError`. Guide: " +
+  "Read with `watchTool` on `query-records`; write on a click with `update-record` " +
+  "(`if_updated_at: record.updatedAt`), then `invalidate`; on a conflict, read again. Declare only the tools called. " +
+  "Replies: a record, an array, or `{records}`; refusals are `isError`. " +
   "https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
