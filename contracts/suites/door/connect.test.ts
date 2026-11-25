@@ -24,6 +24,9 @@ describe("what an app is told before it connects", () => {
     expect(as.token_endpoint_auth_methods_supported).toContain("none");
     expect(prm.scopes_supported).toContain(`vault:${door().vault}:read`);
     fpEach("connect/authorization-server", as);
+    // Admin is requestable by name but not listed (T-476): clients such as claude.ai ask for everything listed.
+    expect(prm.scopes_supported).not.toContain(`vault:${door().vault}:admin`);
+    expect(as.scopes_supported).not.toContain("vault:admin");
     fp("connect/admin-scope.advertised", prm.scopes_supported.includes(`vault:${door().vault}:admin`));
   });
 
@@ -142,6 +145,16 @@ describe.skipIf(lacks("oauth-approval"))("connecting an app (OAuth)", () => {
       (e) => ({ refused: String(e.message).slice(0, 80) }),
     );
     fp("connect/admin-scope", asked);
+  });
+
+  // T-476 claudereal: claude.ai asks for read, write and admin, and the person presses Approve without reading further.
+  // That must give the app read and write: admin waits for the person's own tick, on every door.
+  test("an app that asks for admin, approved on the page as drawn, gets read and write", async () => {
+    const v = door().vault;
+    const app = await connect({ appName: `Claude ${runId("app")}`, scope: () => `vault:${v}:read vault:${v}:write vault:${v}:admin`, asDrawn: true });
+    const granted = app.scope.split(" ").map((s) => s.split(":").pop()).sort().join(" ");
+    expect(granted).toBe("read write");
+    fp("connect/admin-scope.as-drawn", granted);
   });
 
   test("a revoked app stops working", async () => {

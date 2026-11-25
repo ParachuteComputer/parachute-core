@@ -116,6 +116,16 @@ Canonical implementations:
   verb-shaped test (`scopeIsAdmin`) is NOT sufficient and was the bypass this
   rule exists to close. These shortcuts are hub-only — the cloud door has
   neither, so it has no counterpart gate.
+- **Vault admin is requestable, not advertised (T-476).** Discovery
+  (`scopes_supported` on the hub's authorization-server and protected-resource
+  documents and the vault's per-vault ones) lists `vault:read` and
+  `vault:write` only. Clients such as claude.ai request everything listed, so a
+  listed admin became every connector's ask. An app that needs admin asks for
+  it by name. On the consent page admin starts unticked, marked powerful, and
+  is granted only when the person ticks it; when the app didn't ask, it is
+  offered unticked under "Grant additional access". Parachute's own app keeps
+  the admin it asks for ticked (it asks only when the person pressed Manage).
+  Parachute Cloud lists the same two scopes.
 - **Vault-bound consent drops foreign scopes.** When a client sends an
   RFC 8707 `resource=<origin>/vault/<name>/mcp` indicator (an MCP client
   connecting to one vault), the hub narrows the consent — and the minted
