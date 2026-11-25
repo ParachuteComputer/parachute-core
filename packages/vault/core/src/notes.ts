@@ -463,7 +463,7 @@ export function isValidIfUpdatedAt(value: unknown): value is string {
 }
 
 export const IF_UPDATED_AT_HINT =
-  "pass the note's updated_at exactly as you read it (an ISO-8601 timestamp, e.g. 2026-07-09T00:00:00.000Z)";
+  "pass the note's updatedAt exactly as you read it (an ISO-8601 timestamp, e.g. 2026-07-09T00:00:00.000Z)";
 
 /**
  * Thrown by `updateNote` when an `if_updated_at` precondition does not match

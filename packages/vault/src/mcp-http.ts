@@ -346,7 +346,7 @@ export async function handleMcp(
           error_type: "precondition_required",
           note_id: e.note_id,
           path: e.note_path ?? null,
-          hint: "re-read the note, pass its updated_at as if_updated_at, or pass force: true to skip the check",
+          hint: "re-read the note and pass its updatedAt as if_updated_at, or pass force: true to skip the check",
         });
       }
       // Any other QueryError (vault#554) — FIELD_NOT_INDEXED, UNKNOWN_OPERATOR,

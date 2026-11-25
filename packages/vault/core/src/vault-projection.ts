@@ -363,6 +363,16 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
   return `This connection can read only the records tagged ${list} (subtags included); other records are hidden from it.${can.scoped}`;
 }
 
+/**
+ * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
+ * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
+ */
+export const LIVE_PAGE_BLOCK =
+  "A Claude artifact over this vault reads with `watchTool` on `query-records` and writes on a click with " +
+  "`update-record` (`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again. It declares " +
+  "only the tools it calls. A reply is a record, an array, or an object with `records`. Guide: " +
+  "https://parachute.computer/docs/use/claude-artifacts/";
+
 export function projectionToMarkdown(args: {
   vaultName: string;
   description?: string | null;
@@ -532,9 +542,9 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push("## Querying");
   lines.push("");
-  for (const hint of projection.query_hints) {
-    lines.push(`- \`${w(hint)}\``);
-  }
+  // T-476: one line, not the five hints (`vault-info` still returns them): query-records' own description, which
+  // every client reads with the tool list, says each filter, so the brief keeps its budget for what only it can say.
+  lines.push(w("`query-notes { type: \"X\" }` lists a type, subtypes too; the tool's description has every filter (`metadata` operators, `search`, `near`, `id`)."));
 
   lines.push("");
   lines.push("## Refreshing context");
@@ -545,6 +555,13 @@ export function projectionToMarkdown(args: {
   lines.push("## Attachments");
   lines.push("");
   lines.push(w(attachmentsInstructionBlock(args.attachments ?? { ticketsEnabled: false })));
+
+  // T-476: a live page (a Claude artifact) calls this connector on every view, without the model. These are the
+  // words a page needs to be right the first time: the reply's shape and the concurrency token as a record carries it.
+  lines.push("");
+  lines.push("## Live pages (Claude artifacts)");
+  lines.push("");
+  lines.push(LIVE_PAGE_BLOCK);
 
   // Scripting pointer block: the connect-time brief used to dead-end on
   // querying — an agent had no path to "how do I script/automate against this

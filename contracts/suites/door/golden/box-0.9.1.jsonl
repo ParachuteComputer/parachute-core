@@ -121,7 +121,7 @@
 {"key":"links/link.shape","value":{"createdAt":"string","relationship":"string","sourceId":"string","sourceNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"},"targetId":"string","targetNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"}}}
 {"key":"links/unresolved.warning","value":[{"code":"string","message":"string","relationship":"string","target":"string"}]}
 {"key":"mcp/admin.capabilities","value":["tools"]}
-{"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
+{"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
 {"key":"mcp/admin.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/admin.tool-count","value":25}
 {"key":"mcp/admin.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
@@ -191,7 +191,7 @@
 {"key":"mcp/admin.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.query-records.present","value":true}
 {"key":"mcp/admin.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/admin.tool.query-records.words","value":"6b300af44bee705b"}
+{"key":"mcp/admin.tool.query-records.words","value":"004928dd42f9c5dd"}
 {"key":"mcp/admin.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.read-attachment.present","value":true}
 {"key":"mcp/admin.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -215,7 +215,7 @@
 {"key":"mcp/admin.tool.update-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-record.present","value":true}
 {"key":"mcp/admin.tool.update-record.schema","value":"1e39438587b403ef"}
-{"key":"mcp/admin.tool.update-record.words","value":"cd1370f53159bc57"}
+{"key":"mcp/admin.tool.update-record.words","value":"afd69878fc69e3b9"}
 {"key":"mcp/admin.tool.update-tag.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-tag.present","value":true}
 {"key":"mcp/admin.tool.update-tag.schema","value":"ca7b0b3fc10294db"}
@@ -255,7 +255,7 @@
 {"key":"mcp/reach.write","value":"This connection can read the whole vault, and create, change and delete its records."}
 {"key":"mcp/read-calls-write-tool","value":"no such tool"}
 {"key":"mcp/read.capabilities","value":["tools"]}
-{"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
+{"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
 {"key":"mcp/read.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/read.tool-count","value":10}
 {"key":"mcp/read.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
@@ -285,7 +285,7 @@
 {"key":"mcp/read.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.query-records.present","value":true}
 {"key":"mcp/read.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/read.tool.query-records.words","value":"6b300af44bee705b"}
+{"key":"mcp/read.tool.query-records.words","value":"004928dd42f9c5dd"}
 {"key":"mcp/read.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.read-attachment.present","value":true}
 {"key":"mcp/read.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -298,7 +298,7 @@
 {"key":"mcp/read.tool.vault-info.present","value":true}
 {"key":"mcp/read.tool.vault-info.schema","value":"530ff43b9f863786"}
 {"key":"mcp/read.tool.vault-info.words","value":"dee3e40876423132"}
-{"key":"mcp/refusal.blind-update","value":{"code":-32602,"hint":"d9347237c2bf1d18","keys":["error_type","hint","note_id","path"],"type":"precondition_required"}}
+{"key":"mcp/refusal.blind-update","value":{"code":-32602,"hint":"4173c86cffc0aa4a","keys":["error_type","hint","note_id","path"],"type":"precondition_required"}}
 {"key":"mcp/refusal.message-names-its-type","value":true}
 {"key":"mcp/refusal.path-taken","value":{"code":-32600,"keys":["error_type","path"],"type":"path_conflict"}}
 {"key":"mcp/root.cold","value":{"challenge":"Bearer resource_metadata=\"…\"","status":401}}
@@ -313,7 +313,7 @@
 {"key":"mcp/update-note.result.shape","value":{"content":"string","created":"boolean","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","tags":["string"],"types":[],"updatedAt":"string"}}
 {"key":"mcp/vault-info.result.keys","value":["coordinates","description","getting_started","indexed_fields","map","name","query_hints","tags"]}
 {"key":"mcp/write.capabilities","value":["tools"]}
-{"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
+{"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
 {"key":"mcp/write.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/write.tool-count","value":18}
 {"key":"mcp/write.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
@@ -363,7 +363,7 @@
 {"key":"mcp/write.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.query-records.present","value":true}
 {"key":"mcp/write.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/write.tool.query-records.words","value":"6b300af44bee705b"}
+{"key":"mcp/write.tool.query-records.words","value":"004928dd42f9c5dd"}
 {"key":"mcp/write.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.read-attachment.present","value":true}
 {"key":"mcp/write.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -383,7 +383,7 @@
 {"key":"mcp/write.tool.update-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.update-record.present","value":true}
 {"key":"mcp/write.tool.update-record.schema","value":"1e39438587b403ef"}
-{"key":"mcp/write.tool.update-record.words","value":"cd1370f53159bc57"}
+{"key":"mcp/write.tool.update-record.words","value":"afd69878fc69e3b9"}
 {"key":"mcp/write.tool.vault-info.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.vault-info.present","value":true}
 {"key":"mcp/write.tool.vault-info.schema","value":"530ff43b9f863786"}
@@ -425,7 +425,7 @@
 {"key":"rest/refusal.bad-credential","value":{"error":"Unauthorized","keys":["error","message"],"status":401}}
 {"key":"rest/refusal.bad-cursor","value":{"error":"(text)","hint":null,"keys":["code","error","error_type"],"status":400,"type":"cursor_invalid"}}
 {"key":"rest/refusal.batch-half-bad","value":{"error":"path_conflict","hint":"668620dee24032c3","keys":["error","error_type","hint","message","path"],"status":409,"type":"path_conflict"}}
-{"key":"rest/refusal.blind-update","value":{"error":"precondition_required","hint":"3c9c6b683ee4084a","keys":["error","error_type","hint","message","note_id","path"],"status":428,"type":"precondition_required"}}
+{"key":"rest/refusal.blind-update","value":{"error":"precondition_required","hint":"a4304fabc884d396","keys":["error","error_type","hint","message","note_id","path"],"status":428,"type":"precondition_required"}}
 {"key":"rest/refusal.describe-without-admin","value":{"error":"Forbidden","hint":null,"keys":["error","error_type","granted_scopes","message","required_scope"],"status":403,"type":"insufficient_scope"}}
 {"key":"rest/refusal.no-credential","value":{"error":"Unauthorized","keys":["error","message"],"status":401,"www":""}}
 {"key":"rest/refusal.no-such-note","value":{"error":"(text)","hint":null,"keys":["error","error_type"],"status":404,"type":"not_found"}}

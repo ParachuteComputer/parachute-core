@@ -134,7 +134,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
     description: `Change a note (id, path or title), or several with \`notes: [{id, …}]\`.
 - Content: \`content\` (replace all), \`append\`/\`prepend\`, or \`content_edit\` (old_text must occur once).
 - \`metadata\` merges (null deletes a key); \`tags\`/\`links\` take {add, remove}.
-- Except append/prepend, pass \`if_updated_at\` (the updated_at you read) or \`force: true\`.
+- Except append/prepend, pass \`if_updated_at\` (the note's \`updatedAt\` as you read it) or \`force: true\`.
 - \`if_missing: "create"\` makes the note if missing. ${HELP("update-note")}`,
     inputSchema: obj(
       {
