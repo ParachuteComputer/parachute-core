@@ -13,6 +13,9 @@ import { tmpdir } from "os";
 import * as OTPAuth from "otpauth";
 
 const testDir = join(tmpdir(), `vault-2fa-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+// the suite's home (the preload's), put back after: a later file in the same run reads it at load (vault-rename's
+// mkdtemp under it failed with ENOENT once this file had removed its own dir)
+const suiteHome = process.env.PARACHUTE_HOME;
 process.env.PARACHUTE_HOME = testDir;
 
 const {
@@ -39,6 +42,7 @@ beforeEach(() => {
 
 afterAll(() => {
   if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
+  process.env.PARACHUTE_HOME = suiteHome;
 });
 
 // ---------------------------------------------------------------------------
