@@ -674,9 +674,10 @@ export interface GenerateMcpToolsOpts {
     /** The session's grant, stamped on each ticket so its spend re-checks that it is still in force. */
     grant?: string;
     /**
-     * Store an upload's bytes exactly as this door's ticket spend does (the same writer, scope and grant re-check,
-     * transcription decision and attachment row). When provided, `generateMcpTools` lists `add-attachment`, which
-     * takes the bytes in the call (T-476); omitted, that tool is absent. Returns the new attachment row.
+     * Store an upload's bytes exactly as this door's ticket spend does (the same writer, transcription decision and
+     * attachment row). It checks nothing itself: `add-attachment` has already checked the record, its scope, the
+     * file and the extension in this same call, and a door that meters storage gates it here. When provided,
+     * `generateMcpTools` lists `add-attachment` (T-476); omitted, that tool is absent. Returns the new attachment row.
      */
     storeUpload?: (ticket: AttachmentTicket, bytes: Uint8Array) => Promise<Attachment>;
   };
