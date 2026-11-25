@@ -2660,6 +2660,8 @@ not reach the ticket URL, but its MCP calls always arrive. `add-attachment
 - The `file` schema is marked `x-mcp-file` only for a `tools/list` whose
   `_meta` declares the extension; other clients see it unmarked, so a model
   can fill it itself. Not listed on the account door. Same tool on 0.9.
+- Refusals take this vault's usual shape (a JSON-RPC error with
+  `data.error_type`), not the extension's `isError` tool result.
 
 ### MCP
 
