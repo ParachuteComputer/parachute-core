@@ -381,12 +381,12 @@ export const SKILLS_LINE =
 
 /**
  * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
- * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
+ * record words: every door that sends this brief lists the record tools. The reply shapes and a record's keys are in
+ * query-records' own description; the long form is the docs page it names and the `live-page` skill.
  */
 export const LIVE_PAGE_BLOCK =
-  "Read with `watchTool` on `query-records`; write on a click with `update-record` " +
-  "(`if_updated_at: record.updatedAt`), then `invalidate`; on a conflict, read again. Declare only the tools called. " +
-  "Replies: a record, an array, or `{records}`; refusals are `isError`. " +
+  "A Claude artifact reads with `watchTool` on `query-records` and writes on a click with `update-record` " +
+  "(`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again; a refusal is `isError`. Guide: " +
   "https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
@@ -569,7 +569,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   // T-476: one line, not the five hints (`vault-info` still returns them): query-records' own description, which
   // every client reads with the tool list, says each filter, so the brief keeps its budget for what only it can say.
-  lines.push(w("`query-notes { type: \"X\" }` lists a type, subtypes too; its description and parameters list each filter (`metadata` operators, `search`, `near`, `id`)."));
+  lines.push(w("`query-notes { type: \"X\" }` lists a type and its subtypes; the tool says every filter."));
 
   lines.push("");
   lines.push("## Refreshing context");

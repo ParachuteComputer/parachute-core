@@ -18,8 +18,8 @@ async function call(url: string, bearer: string, name: string, args: Record<stri
   return JSON.parse(data);
 }
 
-/** The one shape, checked whole; what the refusal said, for the fingerprint. */
-function oneShape(label: string, body: any, type: string) {
+/** The one shape, checked whole; what the refusal said, for the fingerprint (unless `print` is false). */
+function oneShape(label: string, body: any, type: string, print = true) {
   expect({ label, rpcError: body?.error ?? null }).toEqual({ label, rpcError: null });
   const r = body.result;
   expect({ label, isError: r?.isError }).toEqual({ label, isError: true });
@@ -31,7 +31,40 @@ function oneShape(label: string, body: any, type: string) {
   expect(r.content).toHaveLength(1);
   expect(r.content[0].type).toBe("text");
   expect(JSON.parse(r.content[0].text)).toEqual(sc);
-  fp(`refusals/${label}`, { type: sc.error_type, keys: Object.keys(sc).sort() });
+  if (print) fp(`refusals/${label}`, { type: sc.error_type, keys: Object.keys(sc).sort() });
+  return sc;
+}
+
+/** A raw tools/call on a 2026-07-28 connection (per-request `_meta` envelope): core's second door, mcp-modern.ts. */
+const MODERN = "2026-07-28";
+async function modernCall(url: string, bearer: string, name: string, args: Record<string, unknown>): Promise<any> {
+  const r = await safeFetch(url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-protocol-version": MODERN,
+      "mcp-method": "tools/call",
+      "mcp-name": name,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name,
+        arguments: args,
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": MODERN,
+          "io.modelcontextprotocol/clientCapabilities": {},
+          "io.modelcontextprotocol/clientInfo": { name: "parachute-door-contracts", version: "0" },
+        },
+      },
+    }),
+  });
+  const text = await r.text();
+  return JSON.parse(text.trim().startsWith("{") ? text : ([...text.matchAll(/^data:\s*(.*)$/gm)].at(-1)?.[1] ?? "null"));
 }
 
 describe("one way to refuse", () => {
@@ -66,6 +99,38 @@ describe("one way to refuse", () => {
       const badText = await bad.text();
       const badBody = JSON.parse(badText.trim().startsWith("{") ? badText : ([...badText.matchAll(/^data:\s*(.*)$/gm)].at(-1)?.[1] ?? "null"));
       expect(badBody.error?.code).toBe(-32601);
+    } finally {
+      await c.close();
+    }
+  });
+
+  // The box's 2026-07-28 door is its own code (mcp-modern.ts, SDK v2) beside the 2025 one, and it is the door Claude
+  // Code reaches for skills. It refuses as the 2025 door does, word for word. It comes with the Skills extension, so a
+  // door without that (cloud's own 2026-07-28 handler, deliberate.json skills-extension) isn't asked here; the 2025
+  // test above holds every door. No fingerprints: the 2025 door's are the record, and this one must equal them.
+  test.skipIf(lacks("skills-extension"))("the vault door on a 2026-07-28 connection: the same refusals, the same words", async () => {
+    const url = `${door().vaultOrigin}/vault/${door().vault}/mcp`;
+    const w = await token("write");
+    const c = await mcp("write");
+    try {
+      const path = `${runId("refuse-modern")}/one`;
+      const made = await c.call("create-record", { path, body: "first" });
+      await c.call("update-record", { id: made.id, body: "second", if_updated_at: made.updatedAt });
+      const cases: [string, string, string, Record<string, unknown>, string][] = [
+        ["conflict", w, "update-record", { id: made.id, body: "third", if_updated_at: made.updatedAt }, "conflict"],
+        ["blind-write", w, "update-note", { id: path, content: "blind" }, "precondition_required"],
+        ["missing-record", w, "query-records", { id: `${path}-nope` }, "not_found"],
+        ["path-taken", w, "create-record", { path, body: "again" }, "path_conflict"],
+        ["unknown-parameter", w, "query-records", { typo_param: 1 }, "unknown_parameter"],
+        ["unknown-tool", w, "no-such-tool", {}, "unknown_tool"],
+        ["above-level", await token("read"), "create-record", { path: `${path}-r`, body: "x" }, "unknown_tool"],
+      ];
+      for (const [label, bearer, name, args, type] of cases) {
+        const modern = oneShape(`modern.${label}`, await modernCall(url, bearer, name, args), type, false);
+        // the same refusal the 2025 door says, field for field (the conflict's tokens are the same record's)
+        const old = (await call(url, bearer, name, args)).result?.structuredContent;
+        expect({ label, modern }).toEqual({ label, modern: old });
+      }
     } finally {
       await c.close();
     }

@@ -34,7 +34,8 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
   `internal_error`). The `error_type` words and fields are unchanged; `message` no longer starts with `[error_type]`;
   a reply's own `error` key is gone (its words are `message`). Why: a host that turns a JSON-RPC error into its own
   (Claude's artifact runtime: `upstream_error`) lost the vault's words, and a refusal that looked like data could be
-  taken for a record. The account door answers the same shape, keeps a vault's own `error_type` (it said
+  taken for a record. Both MCP eras answer it the same, word for word: the 2025 door and the 2026-07-28 one (Skills
+  extension, #162). The account door answers the same shape, keeps a vault's own `error_type` (it said
   `vault_error`), and a fan-out row (query-records across vaults) carries the vault's `error_type` beside `error`.
   `vault-info`'s description refusals now carry `insufficient_scope` / `tag_scope_violation`; delete-tag's
   `tag_referenced_as_parent` has words. Clients: read `result.structuredContent` when `result.isError`; a client
