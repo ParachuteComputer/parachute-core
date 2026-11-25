@@ -57,10 +57,10 @@ run there (its asks name where the embeds come from, which a view can't resolve)
 Known gaps, as the app's design names them for a new device: a door keeps no state, so there is no floor (deleting the
 newest approval brings back an older one for the same code), and approvals are read up to 2,000 records.
 
-The applets are served on a 2025-era connection: the MCP Apps spec's, and what claude.ai and the reference host speak.
-A 2026-07-28 connection (`src/mcp-modern.ts`, Claude Code's, for the Skills extension) lists no `open-*` tools and no
-`ui://` resources, since its resources are the skills' files. They come to it when both eras share one server
-(mcp-modern.ts's subtract line, by 12-18).
+Both MCP eras serve the applets the same way: a 2025 connection (the reference host's) and a 2026-07-28 one
+(`src/mcp-modern.ts`), where the `ui://` views sit beside the Skills extension's files. claude.ai connects on
+2026-07-28 and declares MCP Apps there in every request's `_meta` (`io.modelcontextprotocol/ui`, 11-25). Neither era
+gates the applets on that declaration: a client that can't show a view still gets the open tool's one line.
 
 ## `GET /api/approval-keys` (hub)
 

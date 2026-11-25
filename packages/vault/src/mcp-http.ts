@@ -85,13 +85,14 @@ export async function handleScopedMcp(
   // the door; given a parsed body the check applies no size cap of its own, so a large 2025 request stays 2025.
   const parsedBody = await jsonBody(req);
   if (!(await isLegacyRequest(req, parsedBody))) {
-    const tools = toolSurface(getTools, vaultName, auth);
+    const view = viewHtml();
+    const tools = toolSurface(getTools, vaultName, auth, view ? { bearer: callerBearer ?? null } : undefined);
     const skills = vaultSkillSource({
       vaultName,
       projection: () => scopedProjection(vaultName, auth),
       queryRecords: tools.byName("query-records"),
     });
-    return handleModernMcp(req, { serverName, instruction, tools, skills }, parsedBody);
+    return handleModernMcp(req, { serverName, instruction, tools, skills, views: view ? appletViews(tools, view, vaultName) : undefined }, parsedBody);
   }
   return handleMcp(req, getTools, serverName, vaultName, auth, instruction, { bearer: callerBearer ?? null, parsedBody });
 }
@@ -124,7 +125,6 @@ export async function handleMcp(
 
   // The vault's approved applets as an MCP App (mcp-app.ts): each its own tool and ui:// view. With a view to serve,
   // the door offers resources; the applets themselves are read only when a request needs them, once per request.
-  // Only this (2025) era serves them: the 2026-07-28 door's resources are the Skills extension's (mcp-modern.ts).
   const view = viewHtml();
   const server = new Server(
     { name: serverName, version: "0.1.0" },
@@ -138,14 +138,12 @@ export async function handleMcp(
   server.setRequestHandler(ListToolsRequestSchema, async (request) => ({ tools: await tools.list(request.params?._meta) }));
   server.setRequestHandler(CallToolRequestSchema, (request) => tools.call(request));
   if (view) {
-    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: (await tools.applets()).map((a) => ({ uri: appletUri(a.id), name: a.name, title: a.name, mimeType: MCP_APP_MIME })),
-    }));
+    const views = appletViews(tools, view, vaultName);
+    server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: await views.list() }));
     server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      const uri = request.params.uri;
-      const a = uri.startsWith(APPLET_URI_PREFIX) ? (await tools.applets()).find((x) => appletUri(x.id) === uri) : undefined;
-      if (!a) throw new McpError(ErrorCode.InvalidParams, `No resource ${uri}`);
-      return resourceOf(view, a, vaultName);
+      const r = await views.read(request.params.uri);
+      if (!r) throw new McpError(ErrorCode.InvalidParams, `No resource ${request.params.uri}`);
+      return r;
     });
   }
 
@@ -154,9 +152,29 @@ export async function handleMcp(
 }
 
 /**
+ * The approved applets' views (`ui://parachute/applet/<id>`) for one request, as both eras serve them: the 2025 door
+ * as its resources, the 2026-07-28 door beside the Skills extension's files (mcp-modern.ts). `read` is null for a view
+ * this key may not open, so that answer is the same as for one that doesn't exist.
+ */
+export function appletViews(tools: ReturnType<typeof toolSurface>, view: string, vaultName: string): AppletViews {
+  return {
+    list: async () => (await tools.applets()).map((a) => ({ uri: appletUri(a.id), name: a.name, title: a.name, mimeType: MCP_APP_MIME })),
+    read: async (uri) => {
+      const a = uri.startsWith(APPLET_URI_PREFIX) ? (await tools.applets()).find((x) => appletUri(x.id) === uri) : undefined;
+      return a ? resourceOf(view, a, vaultName) : null;
+    },
+  };
+}
+
+export interface AppletViews {
+  list: () => Promise<Array<{ uri: string; name: string; title: string; mimeType: string }>>;
+  read: (uri: string) => Promise<ReturnType<typeof resourceOf> | null>;
+}
+
+/**
  * The vault's tools for one request: what `tools/list` shows this key and how `tools/call` runs one. Both MCP eras
- * serve these same handlers (T-476): the 2025 path above and the 2026-07-28 path in mcp-modern.ts. With `app` (the
- * 2025 door, when it has a view to serve), the vault's approved applets are tools too, one `open-<id>` each (mcp-app.ts).
+ * serve these same handlers (T-476): the 2025 path above and the 2026-07-28 path in mcp-modern.ts. With `app` (when
+ * the door has a view to serve), the vault's approved applets are tools too, one `open-<id>` each (mcp-app.ts).
  */
 export function toolSurface(
   getTools: () => McpToolDef[],

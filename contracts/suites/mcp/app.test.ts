@@ -77,17 +77,42 @@ describe("mcp/app: the person's approved applets as an MCP App", () => {
     expect(t.inputSchema).toEqual({ type: "object", properties: {} });
   });
 
-  test("a 2026-07-28 connection lists no applet: its resources are the skills', so it has no ui:// view to give", async () => {
-    const MODERN = "2026-07-28";
-    const r = await safeFetch(`${s.vaultViaHub}/mcp`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${await pass({ level: "read" })}`, "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": MODERN, "mcp-method": "tools/list" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: { "io.modelcontextprotocol/protocolVersion": MODERN, "io.modelcontextprotocol/clientCapabilities": {}, "io.modelcontextprotocol/clientInfo": { name: "parachute-contracts", version: "0" } } } }),
-    });
-    const body: any = await r.json();
-    const names: string[] = body.result.tools.map((t: any) => t.name);
-    expect(names).toContain("query-records"); // the 2026-07-28 door answered
-    expect(names.filter((n) => n.startsWith("open-"))).toEqual([]);
+  // claude.ai connects on 2026-07-28 and declares MCP Apps in every request's `_meta` (claudereal, 11-25): that door
+  // serves the same applets, beside the Skills extension's files.
+  test("a 2026-07-28 connection, as claude.ai makes one: the same tiles, the same views, the same refusals", async () => {
+    const bearer = await pass({ level: "read" });
+    let id = 0;
+    const modern = async (method: string, params: Record<string, unknown> = {}, name?: string) => {
+      const r = await safeFetch(`${s.vaultViaHub}/mcp`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2026-07-28", "mcp-method": method, ...(name ? { "mcp-name": name } : {}) },
+        body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params: { ...params, _meta: {
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientCapabilities": { extensions: { "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app"] } } },
+          "io.modelcontextprotocol/clientInfo": { name: "Anthropic/ClaudeAI", version: "1.0.0" },
+        } } }),
+      });
+      return (await r.json()) as any;
+    };
+    const list = await modern("tools/list");
+    expect(list.result.resultType).toBe("complete"); // the 2026-07-28 door answered, not the 2025 one
+    const tools = list.result.tools as any[];
+    expect(tools.filter((t) => t.name.startsWith("open-") && t.name.endsWith(tag)).map((t) => t.name)).toEqual([`open-${ids.ok}`]);
+    expect(tools.find((t) => t.name === `open-${ids.ok}`)._meta.ui).toEqual({ resourceUri: `ui://parachute/applet/${ids.ok}` });
+    const res = await modern("resources/list");
+    expect((res.result.resources as any[]).filter((r) => r.uri.endsWith(tag)).map((r) => r.uri)).toEqual([`ui://parachute/applet/${ids.ok}`]);
+    const read = await modern("resources/read", { uri: `ui://parachute/applet/${ids.ok}` }, `ui://parachute/applet/${ids.ok}`);
+    const c = read.result.contents[0];
+    expect(c.mimeType).toBe("text/html;profile=mcp-app");
+    expect(JSON.parse(/<script type="application\/json" id="parachute-applet">(.*?)<\/script>/s.exec(c.text)![1]!).code).toContain(ids.ok);
+    for (const other of [ids.none, ids.strange, ids.changed, ids.back]) {
+      const no = await modern("resources/read", { uri: `ui://parachute/applet/${other}` }, `ui://parachute/applet/${other}`);
+      expect(no.error?.message ?? "").toMatch(/No resource/);
+    }
+    const opened = await modern("tools/call", { name: `open-${ids.ok}`, arguments: {} }, `open-${ids.ok}`);
+    expect(opened.result.content).toEqual([{ type: "text", text: `Opened App ${ids.ok} from the ${s.vaultName} vault.` }]);
+    const refused = await modern("tools/call", { name: `open-${ids.none}`, arguments: {} }, `open-${ids.none}`);
+    expect(refused.result.structuredContent?.error_type).toBe("unknown_tool");
   });
 
   test("its view is the applet host with this applet's record and code in it", async () => {
