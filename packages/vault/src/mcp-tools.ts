@@ -53,7 +53,7 @@ import { chooseHubOrigin, mintHubJwt, revokeHubJwt } from "./mcp-install.ts";
 import { looksLikeJwt } from "./hub-jwt.ts";
 import { readGlobalConfig, DEFAULT_PORT } from "./config.ts";
 import { getBaseUrl } from "./oauth-discovery.ts";
-import { getSharedAttachmentTicketProvider } from "./attachment-tickets.ts";
+import { getSharedAttachmentTicketProvider, storeTicketUpload } from "./attachment-tickets.ts";
 import { createFsAttachmentBytesProvider } from "./attachment-bytes.ts";
 
 /**
@@ -138,7 +138,7 @@ export async function getServerInstruction(
     // `generateScopedMcpTools` below) — the connect-time brief can
     // unconditionally teach both the ticket tools and read-attachment on
     // this door.
-    attachments: { ticketsEnabled: true, readEnabled: true },
+    attachments: { ticketsEnabled: true, readEnabled: true, addEnabled: true },
   });
 }
 
@@ -324,6 +324,8 @@ export function generateScopedMcpTools(
       vaultName,
       urlBase: ticketUrlBase,
       ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible } : {}),
+      // add-attachment (T-476): the bytes come in the call and are stored by the ticket spend's own writer.
+      storeUpload: (ticket, bytes) => storeTicketUpload(ticket, bytes, vaultName, store),
     },
     // Attachment bytes (Wave 2 model lane): bun always wires a fresh fs
     // provider per session — cheap (stateless), unlike the ticket

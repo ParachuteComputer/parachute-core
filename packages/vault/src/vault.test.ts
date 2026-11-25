@@ -8199,7 +8199,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names.length).toBe(7);
   });
 
-  test("vault:read + vault:write sees the 11 read+write tools (tag-schema tools moved write → admin; request-attachment-upload is write-tier)", async () => {
+  test("vault:read + vault:write sees the 12 read+write tools (tag-schema tools moved write → admin; request-attachment-upload is write-tier)", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
     expect(new Set(names)).toEqual(
       new Set([
@@ -8214,9 +8214,10 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
         "request-attachment-upload",
         "request-attachment-download",
         "read-attachment",
+        "add-attachment", // T-476: a file sent in the call
       ]),
     );
-    expect(names.length).toBe(11);
+    expect(names.length).toBe(12);
     expect(names).not.toContain("manage-token");
     // Re-tier (this PR): update-tag/delete-tag/rename-tag/merge-tags are now
     // admin-tier — structure/taxonomy curation, not content authorship.
@@ -8228,7 +8229,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("delete-note");
   });
 
-  test("vault:admin sees all 17 tools including manage-token + prune-schema + the tag-schema tools + all three attachment tools", async () => {
+  test("vault:admin sees all 18 tools including manage-token + prune-schema + the tag-schema tools + all four attachment tools", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
@@ -8240,10 +8241,10 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("request-attachment-upload");
     expect(names).toContain("request-attachment-download");
     expect(names).toContain("read-attachment");
-    expect(names.length).toBe(17);
+    expect(names.length).toBe(18);
   });
 
-  test("legacy-derived full token sees all 17 tools (back-compat)", async () => {
+  test("legacy-derived full token sees all 18 tools (back-compat)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -8276,7 +8277,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     } as any);
     const body = await res.json() as any;
     const names: string[] = body.result.tools.map((t: any) => t.name);
-    expect(names.length).toBe(17);
+    expect(names.length).toBe(18);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
     expect(names).toContain("doctor");

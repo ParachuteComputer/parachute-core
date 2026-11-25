@@ -2636,6 +2636,29 @@ hasn't landed yet; until it does, `request-attachment-upload` /
 `request-attachment-download` are simply absent from cloud's MCP tool list
 (D10 — an agent is never shown an affordance the runtime can't back).
 
+### A file in the call: `add-attachment` (T-476)
+
+A sandboxed runtime (Claude's code sandbox, the API code-execution tool) may
+not reach the ticket URL, but its MCP calls always arrive. `add-attachment
+{record, file, transcribe?}` (MCP, `vault:write`) takes the file in the call:
+`file` is the FileInput of MCP's file-transfer extension
+(`io.modelcontextprotocol/files`): `{id, name?, mimeType, size, digest:
+{algorithm: "sha-256", value}, data}`, with `data` the RFC 4648 base64 and
+`digest.value` the SHA-256 in base64url without padding (hex is taken too).
+
+- Checked before anything is stored: `size` must be the decoded length
+  (`size_mismatch`), the SHA-256 must match (`digest_mismatch`), and the file
+  must be at most 24 KiB (`inline_too_large`, with a hint naming
+  `request-attachment-upload`). The cap is what a Claude model was measured
+  to type into one call byte for byte (2026-11-24). Active content is refused
+  by name or, with no name, by type (`blocked_upload_extension`); a missing
+  record is `not_found`.
+- Stored by the same writer as a spent upload ticket. Returns
+  `{attachment: {id, path, mime_type, size}, record}`.
+- The `file` schema is marked `x-mcp-file` only for a `tools/list` whose
+  `_meta` declares the extension; other clients see it unmarked, so a model
+  can fill it itself. Not on the account door. Same tool on 0.9.
+
 ### MCP
 
 `query-notes` supports a read-only, tag-scope-enforced `versions` mode on the
