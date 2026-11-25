@@ -67,7 +67,7 @@ import { runDoctorScan, type DoctorReport, type DoctorScanOpts } from "./doctor.
 import { EmbeddingError, type EmbeddingProvider } from "./embedding/provider.js";
 import { normalize } from "./embedding/vector-codec.js";
 import { QueryError } from "./query-operators.js";
-import { hasSkillType } from "./skills.js";
+import { isSkillTags, skillTypeNames } from "./skills.js";
 
 /**
  * Normalize a `type: "reference"` field value (scalar OR array — see
@@ -878,11 +878,12 @@ export class BunSqliteStore implements Store {
 
     // One resolution per distinct bracket text, shared across sources.
     const replacement = new Map<string, string>();
+    let skillTypes: Set<string> | undefined;
 
     for (const [sourceId, targets] of plan) {
       // T-476: the new path is the renamer's text; written into a skill's body it would be instructions only an admin
       // may write. Without that, the skill keeps its link text as it was.
-      if (!maySkills && hasSkillType(noteOps.getNoteTags(this.db, sourceId))) continue;
+      if (!maySkills && isSkillTags(noteOps.getNoteTags(this.db, sourceId), (skillTypes ??= skillTypeNames(this.db)))) continue;
       const row = this.db.prepare("SELECT content FROM notes WHERE id = ?")
         .get(sourceId) as { content: string } | null;
       if (!row?.content) continue;
@@ -946,6 +947,7 @@ export class BunSqliteStore implements Store {
     ).all(note.id, note.id) as { source_id: string; relationship: string }[];
     if (rows.length === 0) return;
 
+    let skillTypes: Set<string> | undefined;
     const fieldsBySource = new Map<string, Set<string>>();
     for (const r of rows) {
       let set = fieldsBySource.get(r.source_id);
@@ -959,7 +961,7 @@ export class BunSqliteStore implements Store {
     for (const [sourceId, relationships] of fieldsBySource) {
       const source = noteOps.getNote(this.db, sourceId);
       if (!source?.metadata) continue;
-      if (!maySkills && hasSkillType(source.tags)) continue; // T-476: as cascadeRename above
+      if (!maySkills && isSkillTags(source.tags, (skillTypes ??= skillTypeNames(this.db)))) continue; // T-476: as cascadeRename above
 
       const resolution = resolveNoteSchemas(this.getSchemaConfig(), { tags: source.tags ?? [] });
       if (resolution.mergedFields.size === 0) continue;

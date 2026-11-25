@@ -38,34 +38,39 @@ export class SkillWriteError extends Error {
 }
 
 /**
- * The types whose records `query-records { type: "skill" }` returns: `skill` and every type that names it as a parent,
- * however far down (lower-cased). Setting a parent needs admin, but an admin-made subtype's records would still reach
- * an AI that lists skills, so the write rule counts them as skills too.
+ * The types whose records `query-records { type: "skill" }` returns: `skill` and every type declared under it, however
+ * far down (lower-cased; a parent named in any case, with or without a row of its own). Setting a parent needs admin,
+ * but an admin-made subtype's records reach an AI that lists skills, so the write rule counts them as skills too.
  */
 export function skillTypeNames(db: Database): Set<string> {
   const names = new Set<string>([SKILL_TYPE]);
   const h = loadTagHierarchy(db);
-  for (const root of h.allTags) {
-    if (root.toLowerCase() !== SKILL_TYPE) continue;
-    for (const d of getTagDescendants(h, root)) names.add(d.toLowerCase());
-  }
+  const roots = new Set<string>([SKILL_TYPE]);
+  for (const n of [...h.allTags, ...h.childrenOf.keys()]) if (n.toLowerCase() === SKILL_TYPE) roots.add(n);
+  for (const root of roots) for (const d of getTagDescendants(h, root)) names.add(d.toLowerCase());
   return names;
 }
 
+/** Do these tags make a record a skill? `skillTypes` (skillTypeNames) counts subtypes; without it only `skill`. */
+export function isSkillTags(tags: readonly unknown[] | null | undefined, skillTypes?: ReadonlySet<string>): boolean {
+  if (hasSkillType(tags)) return true;
+  return skillTypes !== undefined && Array.isArray(tags) && tags.some((t) => typeof t === "string" && skillTypes.has(stripTagHash(t).toLowerCase()));
+}
+
 /**
- * The write check, given the record before (`wasSkill`) and the tags it will have. Throws when a caller that may not
+ * The write check, given the record before (`wasTags`, or `wasSkill`) and the tags it will have. Throws when a caller that may not
  * write skills (`maySkills` not true) would make, change or unmake one. `skillTypes` (skillTypeNames) counts a
  * subtype of `skill` as a skill too; without it only `skill` itself does.
  */
 export function refuseSkillWrite(
-  shape: { tags?: readonly unknown[] | null; wasSkill?: boolean },
+  shape: { tags?: readonly unknown[] | null; wasSkill?: boolean; wasTags?: readonly unknown[] | null },
   maySkills: boolean | undefined,
   skillTypes?: ReadonlySet<string>,
 ): void {
   if (maySkills === true) return;
-  const tags = shape.tags ?? [];
-  const isSkill = hasSkillType(tags) || (skillTypes !== undefined && tags.some((t) => typeof t === "string" && skillTypes.has(stripTagHash(t).toLowerCase())));
-  if (shape.wasSkill === true && isSkill) throw new SkillWriteError("change a skill");
-  if (shape.wasSkill === true) throw new SkillWriteError("take the skill type off a record");
+  const isSkill = isSkillTags(shape.tags ?? [], skillTypes);
+  const wasSkill = shape.wasSkill === true || isSkillTags(shape.wasTags, skillTypes);
+  if (wasSkill && isSkill) throw new SkillWriteError("change a skill");
+  if (wasSkill) throw new SkillWriteError("take the skill type off a record");
   if (isSkill) throw new SkillWriteError("make a record a skill");
 }

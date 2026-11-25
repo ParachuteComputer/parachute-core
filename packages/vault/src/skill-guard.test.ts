@@ -44,7 +44,9 @@ const admin = (scopedTags: string[] | null): AuthResult => ({
   via: "api",
 });
 
-const create = (a: AuthResult) => generateScopedMcpTools(V, a).find((t) => t.name === "create-note")!;
+const tool = (a: AuthResult, name: string) => generateScopedMcpTools(V, a).find((t) => t.name === name)!;
+const create = (a: AuthResult) => tool(a, "create-note");
+const writer: AuthResult = { ...admin(null), scopes: [`vault:${V}:read`, `vault:${V}:write`] };
 
 describe("the skill rule and a tag-scoped admin key", () => {
   test("an admin key scoped to tags, even to `skill` itself, can't make a skill; a whole-vault admin can", async () => {
@@ -53,5 +55,14 @@ describe("the skill rule and a tag-scoped admin key", () => {
     const scoped = admin(["skill"]);
     const r: any = await create(scoped).execute({ path: "Skills/Other", tags: ["skill"], metadata: { description: "x" }, content: "y" }).catch((e) => e);
     expect(r?.code ?? r?.error_type, JSON.stringify(r)).toMatch(/SKILL_NEEDS_ADMIN|skill_needs_admin/);
+  });
+
+  test("a type declared under `skill` before any skill exists is a skill too; a write key can't add to it or take it off", async () => {
+    await tool(admin(null), "update-tag").execute({ tag: "playbook", parent_names: ["skill"] });
+    const planted: any = await create(writer).execute({ path: "Playbooks/Evil", tags: ["playbook"], content: "evil" }).catch((e) => e);
+    expect(planted?.code ?? planted?.error_type, JSON.stringify(planted)).toMatch(/SKILL_NEEDS_ADMIN|skill_needs_admin/);
+    const made: any = await create(admin(null)).execute({ path: "Playbooks/Close", tags: ["playbook"], content: "Close the books." });
+    const off: any = await tool(writer, "update-note").execute({ id: made.id, tags: { remove: ["playbook"] }, content: "gone", if_updated_at: made.updatedAt }).catch((e) => e);
+    expect(off?.code ?? off?.error_type, JSON.stringify(off)).toMatch(/SKILL_NEEDS_ADMIN|skill_needs_admin/);
   });
 });

@@ -168,7 +168,7 @@ const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
 function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
-  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; wasSkill?: boolean; defaultTags?: string[] },
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; wasTags?: string[]; defaultTags?: string[] },
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): void {
   enforceStrictWrite(store, shape, {
@@ -195,7 +195,6 @@ function mayPublish(store: Store, tagScope: TagScopeCtx): boolean {
   return tagVisibleInScope(publishedTag, tagScope.allowed, tagScope.raw);
 }
 
-import { hasSkillType } from "../core/src/skills.ts";
 import {
   expandContent,
   DEFAULT_EXPAND_DEPTH,
@@ -2663,7 +2662,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true, wasSkill: hasSkillType(existingNote.tags) }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true, wasTags: existingNote.tags }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -3242,7 +3241,7 @@ async function handleNotesInner(
           path: note ? note.path : latestTombstone(db, id)?.path,
           tags: note?.tags ?? [], metadata: version.metadata,
           wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true,
-          wasSkill: hasSkillType(note?.tags),
+          wasTags: note?.tags,
         }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
@@ -3677,7 +3676,7 @@ async function handleNotesInner(
         const projectedMeta = stBody !== undefined
           ? { ...baseMeta, [stBody.field as string]: stBody.to }
           : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true, wasSkill: hasSkillType(note.tags) }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true, wasTags: note.tags }, tagScope);
       }
 
       // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,

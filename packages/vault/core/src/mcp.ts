@@ -85,7 +85,7 @@ import {
 } from "./attachment/bytes-provider.js";
 import { MAX_INLINE_ATTACHMENT_BYTES, readInlineFile } from "./attachment/inline.js";
 import { attachNearTypeWarnings, foldTypeFilter, holdTypes, markTypes, nearSchemaWarnings, nearTypeWarnings, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
-import { hasSkillType, refuseSkillWrite, skillTypeNames } from "./skills.js";
+import { refuseSkillWrite, skillTypeNames } from "./skills.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -765,7 +765,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     tags?: string[];
     metadata?: Record<string, unknown>;
     wasPublished?: boolean;
-    wasSkill?: boolean;
+    wasTags?: string[];
     defaultTags?: string[];
   }): void => {
     enforceStrictWrite(store, shape, {
@@ -1760,7 +1760,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // (existing ∪ incoming), not the raw incoming item — a caller
           // updating one field of an already-conforming note shouldn't have
           // to re-supply every `required` field just to pass validation.
-          enforceStrict({ path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true, wasSkill: hasSkillType(existingNote.tags) });
+          enforceStrict({ path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true, wasTags: existingNote.tags });
 
           // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): a
           // tags-only or links-only "update" leaves `updates` empty, so
@@ -2390,7 +2390,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               const projectedMeta = stItem !== undefined
                 ? { ...baseMeta, [stItem.field as string]: stItem.to }
                 : baseMeta;
-              enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: ((item.tags as any)?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true, wasSkill: hasSkillType(note.tags) });
+              enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: ((item.tags as any)?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true, wasTags: note.tags });
             }
 
             // vault#555 fix 2 — tag and link mutations must bump `updated_at`
@@ -3597,8 +3597,8 @@ export function enforceStrictWrite(
     metadata?: Record<string, unknown>;
     /** Whether the note was published (metadata.published) before this write. */
     wasPublished?: boolean;
-    /** Whether the note was a skill (type `skill`) before this write (skills.ts). */
-    wasSkill?: boolean;
+    /** The note's tags before this write: was it a skill (skills.ts)? */
+    wasTags?: string[];
     /** The tags whose schema defaults the write applies afterwards (all on a create, the added ones on an update). */
     defaultTags?: string[];
   },
