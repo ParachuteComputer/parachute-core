@@ -2162,6 +2162,11 @@ function issueAuthCodeRedirect(
   scopes: string[],
   userId: string,
   deps: OAuthDeps,
+  /**
+   * The person approved the consent page (T-476): the grant keeps no powerful scope they didn't grant this time, so an
+   * admin left unticked stops bringing the page back on every Reconnect (the skip gates read the grant).
+   */
+  consented = false,
 ): Response {
   // Anti-privesc cap at the single choke-point. Runs AFTER any narrowing the
   // callers did (unnamed `vault:admin` → `vault:<picked>:admin`), so it sees
@@ -2220,7 +2225,10 @@ function issueAuthCodeRedirect(
   const grantNow = deps.now?.() ?? new Date();
   const code = db.transaction(() => {
     if (perVaultChoice) applyAccountDoorChoice(db, userId, params.clientId, dedupedScopes, grantNow);
-    recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, perVaultChoice ? isAccountDoorChoiceScope : undefined);
+    const replaces = (scope: string) =>
+      (perVaultChoice && isAccountDoorChoiceScope(scope)) ||
+      (consented && forcesExplicitConsent(scope) && !dedupedScopes.includes(scope));
+    recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, replaces);
     return issueAuthCode(db, {
       clientId: params.clientId,
       userId,
@@ -2790,7 +2798,7 @@ async function handleConsentSubmit(
     scopes = applied.scopes;
   }
 
-  return issueAuthCodeRedirect(db, params, scopes, session.userId, deps);
+  return issueAuthCodeRedirect(db, params, scopes, session.userId, deps, true);
 }
 
 /**

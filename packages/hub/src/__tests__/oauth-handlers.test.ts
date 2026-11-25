@@ -11825,13 +11825,38 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
           capDeps,
         );
         // T-476: a grant holding a powerful scope the ask doesn't name (admin here) no longer skips consent; the page
-        // asks again, so nothing is minted silently at all. Were it to skip, the cap still keeps other:admin out.
+        // asks again, so nothing is minted silently.
+        void verifier;
         expect(res.status).toBe(200);
-        if (res.status === 302) {
-          const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
-          const { scope } = await redeemToScopeAud(db, code ?? "", regSkip.client.clientId, verifier);
-          expect(scope.split(" ")).not.toContain("vault:other:admin");
-        }
+      }
+
+      // Path C' — the skip path's cap, with a grant row poisoned by a scope that isn't powerful: an UNASSIGNED vault's
+      // write. Asking for it and the held write skips consent, and the cap keeps the un-held verb out of the token.
+      const regSkip2 = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      recordGrant(db, friend.id, regSkip2.client.clientId, ["vault:work:write", "vault:other:write"]);
+      {
+        const { verifier, challenge } = makePkce();
+        const res = handleAuthorizeGet(
+          db,
+          new Request(
+            authorizeUrl({
+              client_id: regSkip2.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              scope: "vault:work:write vault:other:write",
+            }),
+            { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+          ),
+          capDeps,
+        );
+        expect(res.status).toBe(302); // skip-consent silent mint, capped
+        const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+        expect(code).toBeString();
+        const { scope } = await redeemToScopeAud(db, code!, regSkip2.client.clientId, verifier);
+        expect(scope.split(" ")).toContain("vault:work:write");
+        expect(scope.split(" ")).not.toContain("vault:other:write");
       }
     } finally {
       cleanup();
@@ -13009,8 +13034,38 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
       for (const clientId of [second.client.clientId, first.client.clientId]) {
         const again = handleAuthorizeGet(db, new Request(ask(clientId, makePkce().challenge), { headers: { cookie: cookie(session.id), origin: ISSUER } }), deps);
         expect(again.status, clientId).toBe(200);
-        expect(await again.text()).toMatch(/<input type="checkbox" name="extra_scope" value="vault:work:admin" \/>/);
+        const html = await again.text();
+        expect(html).toMatch(/<input type="checkbox" name="extra_scope" value="vault:work:admin" \/>/);
+        // The person approves as drawn, admin left unticked: that is their choice now, so the next Reconnect is silent
+        // again rather than showing the page every time (review round 2).
+        const asDrawn = new URLSearchParams(browserFields(html, []));
+        asDrawn.append("approve", "yes");
+        const ok = await handleAuthorizePost(db, new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: asDrawn, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }), deps);
+        expect(ok.status).toBe(302);
+        expect(findGrant(db, owner.id, clientId)!.scopes).not.toContain("vault:work:admin");
+        const third = handleAuthorizeGet(db, new Request(ask(clientId, makePkce().challenge), { headers: { cookie: cookie(session.id), origin: ISSUER } }), deps);
+        expect(third.status, clientId).toBe(302);
       }
+    } finally {
+      cleanup();
+    }
+  });
+  // A connection approved while admin came ticked holds admin in its grant: its first Reconnect shows the page once.
+  test("a grant from before this change: one page on Reconnect, then silent once approved as drawn", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const redirect = "https://claude.ai/api/mcp/auth_callback";
+      const reg = registerClient(db, { redirectUris: [redirect], clientName: "Claude", status: "approved" });
+      recordGrant(db, owner.id, reg.client.clientId, ["vault:work:read", "vault:work:write", "vault:work:admin"]);
+      const ask = () => new Request(authorizeUrl({ client_id: reg.client.clientId, redirect_uri: redirect, response_type: "code", scope: "vault:work:read vault:work:write", code_challenge: makePkce().challenge, code_challenge_method: "S256", resource: MCP }), { headers: { cookie: cookie(session.id), origin: ISSUER } });
+      const page = handleAuthorizeGet(db, ask(), deps);
+      expect(page.status).toBe(200);
+      const form = new URLSearchParams(browserFields(await page.text(), []));
+      form.append("approve", "yes");
+      expect((await handleAuthorizePost(db, new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }), deps)).status).toBe(302);
+      expect(handleAuthorizeGet(db, ask(), deps).status).toBe(302);
     } finally {
       cleanup();
     }
