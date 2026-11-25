@@ -48,8 +48,10 @@ function modernHandler(): ReturnType<typeof createMcpHandler> {
         { instructions: door.instruction, capabilities: { tools: {} } },
       );
       // Core's JSON Schemas are typed loosely (Record<string, unknown>); they are the same objects the 2025 path sends.
-      mcp.server.setRequestHandler("tools/list", async (request) => ({
-        tools: door.tools.list((request.params as { _meta?: unknown } | undefined)?._meta) as never,
+      // SDK v2 hands the request's envelope (`_meta`: protocol version, client capabilities) to the handler apart from
+      // its params; the file argument's `x-mcp-file` mark follows the client's declared capabilities (#164).
+      mcp.server.setRequestHandler("tools/list", async (_request, ctx) => ({
+        tools: door.tools.list(ctx.mcpReq.envelope) as never,
       }));
       mcp.server.setRequestHandler("tools/call", async (request) => {
         try {

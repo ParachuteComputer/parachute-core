@@ -60,7 +60,7 @@ const MODERN = "2026-07-28";
 let id = 0;
 
 /** One 2026-07-28 request, as Claude Code sends it: the envelope in `_meta` and the matching headers. */
-async function modern(method: string, params: Record<string, unknown> = {}, a: AuthResult = auth()): Promise<any> {
+async function modern(method: string, params: Record<string, unknown> = {}, a: AuthResult = auth(), caps: Record<string, unknown> = {}): Promise<any> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
@@ -77,7 +77,7 @@ async function modern(method: string, params: Record<string, unknown> = {}, a: A
       ...params,
       _meta: {
         "io.modelcontextprotocol/protocolVersion": MODERN,
-        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientCapabilities": caps,
         "io.modelcontextprotocol/clientInfo": { name: "test", version: "0" },
       },
     },
@@ -142,6 +142,13 @@ describe("skills over MCP (T-476)", () => {
     expect(names).not.toContain("create-record");
     const made = await modern("tools/call", { name: "create-record", arguments: { path: "X/y", body: "no" } }, read);
     expect(made.result?.isError === true || made.error !== undefined).toBe(true);
+  });
+
+  test("on the 2026-07-28 door a file argument is marked x-mcp-file only for a client that declares the extension", async () => {
+    const fileOf = (r: any) => r.result.tools.find((t: any) => t.name === "add-attachment")?.inputSchema?.properties?.file;
+    const declared = await modern("tools/list", {}, auth(), { extensions: { "io.modelcontextprotocol/files": {} } });
+    expect(fileOf(declared)?.["x-mcp-file"]).toBeDefined();
+    expect(fileOf(await modern("tools/list"))?.["x-mcp-file"]).toBeUndefined();
   });
 
   test("a 2025 request is the door as before: no skills extension, the same tools", async () => {
