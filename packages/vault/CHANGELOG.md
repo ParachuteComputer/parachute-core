@@ -17,6 +17,19 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 - `HEAD /api/records/<id>` (and `/api/notes/<id>`) answers like GET without the body: 200 with GET's headers and the length of its body, 404 for a missing record, and 404 for a record a tag-scoped key can't see. It was passed through with no answer. Reading one record (GET or HEAD, on both routes) now also sends `ETag` (a strong hash of the answer, so it moves on any change the caller can see, tags included) and `Last-Modified` (the record's update time), so a client can tell whether a record changed (0.9.3, T-463).
 
 ### Changed
+- **One way to refuse, on every MCP door (T-476, a meaning change for clients).** Every refusal of a tool call is now
+  a normal result with `isError: true` and `structuredContent: {error_type, message, ...fields}`, its one text block
+  that object as JSON. Before, a refusal came three ways: a JSON-RPC error carrying `data.error_type` (a conflict, a
+  bad query, a schema refusal), a normal reply `{error, error_type}` (a missing record or tag, a tag-scope refusal,
+  manage-keys), or an `isError` result of bare text (`Unknown tool: x`, now `error_type: "unknown_tool"`; a crash is
+  `internal_error`). The `error_type` words and fields are unchanged; `message` no longer starts with `[error_type]`;
+  a reply's own `error` key is gone (its words are `message`). Why: a host that turns a JSON-RPC error into its own
+  (Claude's artifact runtime: `upstream_error`) lost the vault's words, and a refusal that looked like data could be
+  taken for a record. The account door answers the same shape, keeps a vault's own `error_type` (it said
+  `vault_error`), and a fan-out row (query-records across vaults) carries the vault's `error_type` beside `error`.
+  `vault-info`'s description refusals now carry `insufficient_scope` / `tag_scope_violation`; delete-tag's
+  `tag_referenced_as_parent` has words. Clients: read `result.structuredContent` when `result.isError`; a client
+  that must work with older doors too reads `error.data` as before (docs/HTTP_API.md "MCP refusals").
 - **Write access lists a vault's deleted records (T-476).** `GET /history/deleted` took `vault:admin`; it now takes `vault:write`, which may already delete a record and restore it by id, so an AI or app with write access can see what was deleted and put it back. A read pass is refused (403, `required_scope: vault:write`); a tag-scoped pass still gets 404. Erasing history stays admin.
 - The 0.9 tool surface is built in the engine (`core/src/mcp-surface.ts`): the record tools, the eleven tools, the old names as aliases, the tools/list order, `vault-info {help}`, record words in vault-info and refusals, and unknown-parameter teaching. So are the connect-time brief's scripting line (a door may say its own), `HEAD` and the validators on one record (`core/src/http-validators.ts`), and the REST route names the name counts use (`core/src/name-routes.ts`). A box's tools, words and refusals are unchanged; Parachute Cloud builds the same surface from the same code (T-456, cloud parity). Small differences on a box: `vault-info` with both `help` and `description` is refused (`invalid_query`) instead of answering `help` and dropping the description; a tag-scoped caller's `help` answer no longer carries empty `tags` and `indexed_fields` keys; and the refusal of an unknown `help` name lists the tools as tools/list names them (the record tools, the eleven tools, the old names), not the engine's internal list.
 

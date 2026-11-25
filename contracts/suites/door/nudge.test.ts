@@ -110,7 +110,7 @@ describe("the refresh nudge and the read sentence", () => {
       fp("mcp/nudge.create-record.blocks", made.content.map((b) => b.type));
       expect(made.content.length).toBe(1);
       // A refused call (a blind update: no if_updated_at) says why and nothing else: no nudge.
-      const refused = await blocks(c, "update-note", { id: path, content: "blind" }).catch((e) => ({ isError: true, content: [{ type: "rpc-error", text: String(e?.message ?? e) }] as Block[] }));
+      const refused = await blocks(c, "update-note", { id: path, content: "blind" });
       const nudged = refused.content.some((b) => /refresh this connector/.test(b.text ?? ""));
       fp("mcp/nudge.refused-call", { isError: refused.isError, nudged });
       expect(refused.isError).toBe(true);

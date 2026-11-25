@@ -225,7 +225,7 @@ shape as a missing note — we don't leak the existence of private notes).
 auth), `/.parachute/config`, `/.parachute/embeddings` and
 `/.parachute/transcription` act on the whole vault or host, so a token carrying `scoped_tags` gets
 `403 {error:"Forbidden", error_type:"tag_scope_violation", scoped_tags}` even
-with admin (MCP: an in-band `isError` result). A tag-scoped token's stats
+with admin (MCP: an `isError` refusal, `error_type: "tag_scope_violation"`). A tag-scoped token's stats
 (bare vault root, `/.parachute/usage`, `GET /api/vault?include_stats`, MCP
 `vault-info`, the connect-time instructions) count only the notes it can see.
 Since 0.9.1 no mint issues a tag-scoped admin token (scope gap 4: the hub's

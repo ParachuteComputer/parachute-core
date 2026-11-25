@@ -62,9 +62,13 @@ async function callToolContent(
   });
   const res = await handleScopedMcp(req, vaultName, a);
   const body = (await res.json()) as any;
-  if (body.error) {
-    const err = new Error(body.error.message);
-    Object.assign(err, body.error.data ?? {});
+  expect(body.error).toBeUndefined();
+  // a refusal is a normal result with isError + structuredContent {error_type, message, ...fields}; surface it as a
+  // thrown error carrying those fields so each test can assert on error_type and its specific fields
+  if (body.result.isError) {
+    expect(body.result.structuredContent.error_type).toBeString();
+    const err = new Error(body.result.structuredContent.message);
+    Object.assign(err, body.result.structuredContent);
     throw err;
   }
   return body.result.content;

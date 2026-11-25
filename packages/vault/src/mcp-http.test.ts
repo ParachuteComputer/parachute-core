@@ -1,5 +1,5 @@
 /**
- * MCP JSON-RPC error mapping — no double-wrap (vault#555 fix 6).
+ * MCP refusal mapping — no double-wrap (vault#555 fix 6; every refusal is an isError result since T-476).
  *
  * Verified at code: the catch block in `handleMcp` read `err.message` and
  * fed it into a fresh `new McpError(...)`. The MCP SDK's `McpError`
@@ -21,17 +21,15 @@
 import { describe, test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { handleMcp, mcpDomainError } from "./mcp-http.ts";
+import { handleMcp } from "./mcp-http.ts";
+import { plainMessage, refusalOfError, refusalOfReply } from "../core/src/mcp-refusal.ts";
 import { generateMcpTools, type McpToolDef } from "../core/src/mcp.ts";
 import { SqliteStore } from "../core/src/store.ts";
 import type { AuthResult } from "./auth.ts";
 
 interface ToolErrorResponse {
-  error: {
-    code: number;
-    message: string;
-    data: Record<string, unknown>;
-  };
+  error?: unknown;
+  result: { isError: true; structuredContent: { error_type: string; message: string; [k: string]: unknown } };
 }
 
 function toolsWith(execute: (params: Record<string, unknown>) => unknown): () => McpToolDef[] {
@@ -108,29 +106,41 @@ describe("MCP SDK McpError — confirms the mechanics this fix depends on", () =
   });
 });
 
-describe("mcpDomainError — single source of truth for the JSON-RPC mapping (vault#555 fix 6)", () => {
-  test("a plain message gets the error_type token prepended (optional polish)", () => {
-    const err = mcpDomainError(ErrorCode.InvalidParams, "bad stuff happened", { error_type: "invalid_query" });
-    expect(err.message).toBe("MCP error -32602: [invalid_query] bad stuff happened");
-    expect(err.data).toEqual({ error_type: "invalid_query" });
-  });
-
-  test("a message that ALREADY carries the JSON-RPC prefix is not doubled", () => {
-    const err = mcpDomainError(ErrorCode.InvalidParams, "MCP error -32602: bad stuff happened", {
-      error_type: "invalid_query",
+describe("refusalOfError — the one mapping from a thrown error to a refusal (T-476)", () => {
+  test("a plain message with an error_type carries no prefix", () => {
+    expect(refusalOfError(Object.assign(new Error("bad stuff happened"), { error_type: "invalid_query", field: "limit" }))).toEqual({
+      error_type: "invalid_query", message: "bad stuff happened", field: "limit",
     });
-    expect(err.message).toBe("MCP error -32602: [invalid_query] bad stuff happened");
-    expect(err.message).not.toContain("MCP error -32602: MCP error");
   });
 
-  test("no error_type in data — message passes through without a bracketed token", () => {
-    const err = mcpDomainError(ErrorCode.InternalError, "something broke", {});
-    expect(err.message).toBe("MCP error -32603: something broke");
+  test("a message that carries the JSON-RPC prefix and an [error_type] token is stripped of both, once", () => {
+    const r = refusalOfError(Object.assign(new Error("MCP error -32602: [invalid_query] bad stuff happened"), { error_type: "invalid_query" }));
+    expect(r?.message).toBe("bad stuff happened");
+    expect(plainMessage("MCP error -32602: MCP error -32602: x")).toBe("MCP error -32602: x");
+  });
+
+  test("an McpError already formed: its data is the refusal's fields, its message loses the SDK prefix", () => {
+    const err = new McpError(ErrorCode.InvalidParams, "bad stuff happened", { error_type: "invalid_query", hint: "h" });
+    expect(err.message).toBe("MCP error -32602: bad stuff happened");
+    expect(refusalOfError(err)).toEqual({ error_type: "invalid_query", message: "bad stuff happened", hint: "h" });
+  });
+
+  test("an error nobody tagged is not a refusal (the door logs it as a crash)", () => {
+    expect(refusalOfError(new Error("something broke"))).toBeNull();
+  });
+
+  test("a tool's reply that says `error` is a refusal; `error` becomes error_type and the other fields stay", () => {
+    expect(refusalOfReply({ error: "Note not found", error_type: "not_found", id: "n1" })).toEqual({ error_type: "not_found", message: "Note not found", id: "n1" });
+    expect(refusalOfReply({ action: "mint", ok: false, error: "invalid_request", message: "ttl too big" })).toEqual({
+      error_type: "invalid_request", message: "ttl too big", action: "mint", ok: false,
+    });
+    expect(refusalOfReply({ error: "Forbidden", message: "no" })).toEqual({ error_type: "forbidden", message: "no" });
+    expect(refusalOfReply({ id: "n1" })).toBeNull();
   });
 });
 
-describe("handleMcp JSON-RPC error mapping — end to end (vault#555 fix 6)", () => {
-  test("a tool throwing an ALREADY-formed McpError passes through unchanged — no double prefix, data preserved verbatim", async () => {
+describe("handleMcp refusals — end to end (vault#555 fix 6, T-476)", () => {
+  test("a tool throwing an ALREADY-formed McpError is an isError refusal: no prefix, data preserved verbatim as fields", async () => {
     const inner = new McpError(ErrorCode.InvalidRequest, "conflict: note was modified", {
       error_type: "conflict",
       note_id: "abc123",
@@ -139,26 +149,28 @@ describe("handleMcp JSON-RPC error mapping — end to end (vault#555 fix 6)", ()
     const body = await callBoom(() => {
       throw inner;
     });
-    expect(body.error.code).toBe(ErrorCode.InvalidRequest);
-    // Single prefix — NOT "MCP error -32600: MCP error -32600: ...".
-    expect(body.error.message).toBe("MCP error -32600: conflict: note was modified");
-    expect((body.error.message.match(/MCP error/g) ?? []).length).toBe(1);
-    // data.error_type fidelity preserved exactly — nothing re-derived.
-    expect(body.error.data).toEqual({
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBe(true);
+    // Neither "MCP error -32600:" nor a doubled prefix.
+    expect(body.result.structuredContent.message).toBe("conflict: note was modified");
+    expect(body.result.structuredContent).toEqual({
       error_type: "conflict",
+      message: "conflict: note was modified",
       note_id: "abc123",
       hint: "re-read and retry",
     });
+    expect(JSON.parse(body.result.content[0].text)).toEqual(body.result.structuredContent);
   });
 
-  test("a plain domain error (never wrapped) is mapped once, with the error_type token in the human message", async () => {
+  test("a plain domain error (never wrapped) is mapped once: error_type, plain message, its fields", async () => {
     const body = await callBoom(() => {
       throw Object.assign(new Error("something went wrong"), { error_type: "invalid_query", field: "limit" });
     });
-    expect(body.error.message).toBe("MCP error -32602: [invalid_query] something went wrong");
-    expect((body.error.message.match(/MCP error/g) ?? []).length).toBe(1);
-    expect(body.error.data.error_type).toBe("invalid_query");
-    expect(body.error.data.field).toBe("limit");
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBe(true);
+    expect(body.result.structuredContent.message).toBe("something went wrong");
+    expect(body.result.structuredContent.error_type).toBe("invalid_query");
+    expect(body.result.structuredContent.field).toBe("limit");
   });
 
   test("invalid_query forwards how_to (vault#617 bun/cloud symmetry)", async () => {
@@ -169,18 +181,36 @@ describe("handleMcp JSON-RPC error mapping — end to end (vault#555 fix 6)", ()
         how_to: "pass the exact byte length of the file you're about to upload",
       });
     });
-    expect(body.error.data.error_type).toBe("invalid_query");
-    expect(body.error.data.how_to).toBe("pass the exact byte length of the file you're about to upload");
+    expect(body.result.structuredContent.error_type).toBe("invalid_query");
+    expect(body.result.structuredContent.how_to).toBe("pass the exact byte length of the file you're about to upload");
   });
 
-  test("a truly unknown error (no error_type anywhere) falls through to the unstructured isError text, not a thrown McpError", async () => {
+  test("a tool that returns `{error, error_type, ...}` as data is answered as a refusal with its other fields", async () => {
+    const body = await callBoom(() => ({ error: "Note not found", error_type: "not_found", id: "n1" }));
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBe(true);
+    expect(body.result.structuredContent).toEqual({ error_type: "not_found", message: "Note not found", id: "n1" });
+  });
+
+  test("a truly unknown error (no error_type anywhere) is an internal_error refusal, not a thrown McpError", async () => {
     const body = await callBoom(() => {
       throw new Error("plain unstructured failure");
     });
-    // No JSON-RPC `error` — the tool result carries isError: true instead.
     expect(body.error).toBeUndefined();
     expect(body.result.isError).toBe(true);
+    expect(body.result.structuredContent).toEqual({ error_type: "internal_error", message: "Error: plain unstructured failure" });
     expect(body.result.content[0].text).toContain("plain unstructured failure");
+  });
+
+  test("an unknown tool is an unknown_tool refusal naming the tool", async () => {
+    const req = new Request("http://localhost:1940/vault/v/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "nope", arguments: {} } }),
+    });
+    const body: any = await (await handleMcp(req, toolsWith(() => ({})), "test-server", "v", fullAuth(), "")).json();
+    expect(body.result.isError).toBe(true);
+    expect(body.result.structuredContent).toEqual({ error_type: "unknown_tool", message: "Unknown tool: nope", tool: "nope" });
   });
 });
 
@@ -189,14 +219,15 @@ describe("note mutation tools require an id (vault#705)", () => {
     test(`${name} without id returns structured invalid params, never a TypeError`, async () => {
       const body = await callNoteToolWithoutId(name);
 
-      expect(body.error.code).toBe(ErrorCode.InvalidParams);
-      expect(body.error.data).toMatchObject({
+      expect(body.error).toBeUndefined();
+      expect(body.result.isError).toBe(true);
+      expect(body.result.structuredContent).toMatchObject({
         error_type: "missing_required_field",
         field: "id",
         hint: expect.stringContaining("path"),
       });
-      expect(body.error.message).not.toContain("TypeError");
-      expect(body.error.message).not.toContain("idOrPath.match");
+      expect(body.result.structuredContent.message).not.toContain("TypeError");
+      expect(body.result.structuredContent.message).not.toContain("idOrPath.match");
     });
   }
 });

@@ -184,9 +184,8 @@ describe("compat/types-rest: types", () => {
 
     const c = await mcp(`${s.vaultViaHub}/mcp`, adminToken);
     try {
-      const err: any = await c.client.callTool({ name: "create-record", arguments: { path: `${path}-mcp`, body: "x", tags: [type] } }).catch((e) => e);
-      expect(err?.data?.error_type ?? err?.structuredContent?.error_type).toBe("tag_kind");
-      expect((await c.call("query-records", { id: `${path}-mcp` })).error_type).toBe("not_found");
+      expect((await c.refused("create-record", { path: `${path}-mcp`, body: "x", tags: [type] }))?.error_type).toBe("tag_kind");
+      expect((await c.refused("query-records", { id: `${path}-mcp` }))?.error_type).toBe("not_found");
     } finally {
       await c.close();
     }
@@ -218,8 +217,8 @@ describe("compat/types-rest: a tag-scoped pass", () => {
     const m = await mcp(`${s.vaultViaHub}/mcp`, await pass({ level: "write", tags: [work] }));
     try {
       const viaMcp = async (name: string) => {
-        const r: any = await m.client.callTool({ name: "create-record", arguments: { path: `${R}/scoped-mcp-${name}`, body: "x", tags: [work, name] } }).catch((e) => e);
-        return r?.data?.error_type ?? (r?.isError ? "isError" : "ok");
+        const r: any = await m.client.callTool({ name: "create-record", arguments: { path: `${R}/scoped-mcp-${name}`, body: "x", tags: [work, name] } });
+        return r?.structuredContent?.error_type ?? (r?.isError ? "isError" : "ok");
       };
       const mcpType = await viaMcp(hiddenType);
       expect(mcpType).not.toBe("tag_kind");

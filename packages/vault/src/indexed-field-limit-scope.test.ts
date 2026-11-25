@@ -128,7 +128,7 @@ describe("indexed-field ceiling on the doors", () => {
     expect(JSON.stringify({ m: viaTypes.message, u: viaTypes.unused })).not.toContain("secretfield");
   });
 
-  test("MCP over the wire (JSON-RPC): error.data carries the same fields as REST's 409 body", async () => {
+  test("MCP over the wire (isError refusal): structuredContent carries the same fields as REST's 409 body", async () => {
     await atTheLimit();
     const admin: AuthResult = { ...authFor("journal", null), scopes: ["vault:journal:read", "vault:journal:write", "vault:journal:admin"] };
     const req = new Request("http://localhost/vault/journal/mcp", {
@@ -143,7 +143,10 @@ describe("indexed-field ceiling on the doors", () => {
     });
     const res = await handleMcp(req, () => generateScopedMcpTools("journal", admin), "s", "journal", admin, "");
     const reply: any = await res.json();
-    const data = reply.error?.data ?? {};
+    expect(reply.error).toBeUndefined();
+    expect(reply.result.isError).toBe(true);
+    const data = reply.result.structuredContent ?? {};
+    expect(typeof data.message).toBe("string");
     expect(data.error_type).toBe("indexed_field_limit");
     expect(data.fields).toEqual(["x1", "x2"]);
     expect(data.limit).toBe(88);

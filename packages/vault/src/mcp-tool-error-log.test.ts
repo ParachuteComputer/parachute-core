@@ -139,7 +139,8 @@ describe("MCP tool crash → one server log line (audit L6-02)", () => {
   test("a domain refusal (error_type) logs no crash line", async () => {
     const from = output.length;
     const body = await callTool("update-note", { id: MARKER, content: "x" });
-    expect(body.error?.data?.error_type).toBe("not_found");
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent?.error_type).toBe("not_found");
     expect(await crashLinesSince(from, 0)).toEqual([]);
     expect(output).not.toContain(MARKER);
   }, E2E_TIMEOUT);
@@ -265,9 +266,10 @@ describe("handleMcp — a tool that throws on purpose", () => {
     }
   }
 
-  test("a TypeError logs one line; the client's isError text is unchanged", async () => {
+  test("a TypeError logs one line; the client's refusal says internal_error with the same text", async () => {
     const { body, logged } = await callThrowing(new TypeError("x.y is not a function"));
-    expect(body.result).toEqual({ content: [{ type: "text", text: "Error: x.y is not a function" }], isError: true });
+    const sc = { error_type: "internal_error", message: "Error: x.y is not a function" };
+    expect(body.result).toEqual({ content: [{ type: "text", text: JSON.stringify(sc, null, 2) }], structuredContent: sc, isError: true });
     const crashes = logged.filter((l) => l.includes("event=mcp_tool_error"));
     expect(crashes).toHaveLength(1);
     expect(crashes[0]).toStartWith('event=mcp_tool_error tool=boom class=TypeError msg="x.y is not a function" stack="at ');
@@ -277,7 +279,8 @@ describe("handleMcp — a tool that throws on purpose", () => {
   test("an error carrying error_type is a refusal: no line", async () => {
     const refusal = Object.assign(new Error("nope"), { error_type: "not_found" });
     const { body, logged } = await callThrowing(refusal);
-    expect(body.error?.data?.error_type).toBe("not_found");
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent).toEqual({ error_type: "not_found", message: "nope" });
     expect(logged.filter((l) => l.includes("event=mcp_tool_error"))).toEqual([]);
   });
 });

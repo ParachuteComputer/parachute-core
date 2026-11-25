@@ -79,7 +79,7 @@ describe("mcp/records", () => {
     expect(one(await c.call("query-records", { id: b })).body).toBe("end more");
 
     expect((await c.call("delete-record", { id: b })).deleted).toBe(true);
-    expect((await c.call("query-records", { id: b })).error_type).toBe("not_found");
+    expect((await c.refused("query-records", { id: b }))?.error_type).toBe("not_found");
     await c.close();
   });
 
@@ -93,7 +93,7 @@ describe("mcp/records", () => {
     expect(Array.isArray(near)).toBe(true);
     await expect(c.call("create-record", { path: `${path}-2`, body: "a", content: "b" })).rejects.toThrow(/pass `body` or `content`, not both/);
     await expect(c.call("query-records", { near: { note: path } })).rejects.toThrow(/near takes \{id\}, not \{note\}/);
-    await expect(c.call("query-records", { tags: "x", limit: 1 })).rejects.toThrow(/\] query-records has no parameter `tags`\. Did you mean `tag`\?/);
+    await expect(c.call("query-records", { tags: "x", limit: 1 })).rejects.toThrow(/"message": "query-records has no parameter `tags`\. Did you mean `tag`\?/);
     await expect(c.call("update-record", { record_id: "x", append: "y" })).rejects.toThrow(/Did you mean `id`/);
     await c.close();
   });
@@ -103,11 +103,11 @@ describe("mcp/records", () => {
     // Nobody called the record door before 0.9, so it refuses; a 0.8 client on the note door keeps working (SPEC v2 §4.3).
     const c = await session("admin");
     const path = `records/${runId("strict")}`;
-    await expect(c.call("query-records", { typo_param: 1 })).rejects.toThrow(/\] query-records has no parameter `typo_param`\./);
+    await expect(c.call("query-records", { typo_param: 1 })).rejects.toThrow(/"message": "query-records has no parameter `typo_param`\./);
     await expect(c.call("query-records", { metadata_filter: { a: 1 } })).rejects.toThrow(/has no parameter `metadata_filter`/);
     // Refused before anything is written.
-    await expect(c.call("create-record", { path, body: "x", colour: "red" })).rejects.toThrow(/\] create-record has no parameter `colour`/);
-    expect((await c.call("query-records", { id: path })).error_type).toBe("not_found");
+    await expect(c.call("create-record", { path, body: "x", colour: "red" })).rejects.toThrow(/"message": "create-record has no parameter `colour`/);
+    expect((await c.refused("query-records", { id: path }))?.error_type).toBe("not_found");
     await expect(c.call("manage-types", { action: "rename", old_name: "a", new_name: "b", fields: {} })).rejects.toThrow(/manage-types has no parameter `fields`/);
     // Old names and the account door's `vault` are still taken, and `_`-names stay free for clients.
     const made = await c.call("create-record", { path, content: "old word", vault: "ignored-on-this-door", _client: "probe" });
@@ -138,14 +138,14 @@ describe("mcp/records", () => {
     // The conflict error a writer meets most teaches the record tool, and names the record.
     const read = one(await c.call("query-records", { id: path }));
     await c.call("update-record", { id: path, fields: { other: 1 }, if_updated_at: read.updatedAt });
-    const err: any = await c.client.callTool({ name: "update-record", arguments: { id: path, fields: { other: 2 }, if_updated_at: read.updatedAt } }).catch((e) => e);
-    expect(err?.data?.error_type).toBe("conflict");
-    expect(err.data.hint).toContain("query-records");
-    expect(err.data.hint).not.toContain("query-notes");
-    expect(err.data.record_id).toBe(read.id);
-    const old: any = await c.client.callTool({ name: "update-note", arguments: { id: path, metadata: { other: 3 }, if_updated_at: read.updatedAt } }).catch((e) => e);
-    expect(old.data.hint).toContain("query-notes"); // the old tool's error, as 0.8 gave it
-    expect(old.data.note_id).toBe(read.id);
+    const err = await c.refused("update-record", { id: path, fields: { other: 2 }, if_updated_at: read.updatedAt });
+    expect(err?.error_type).toBe("conflict");
+    expect(err.hint).toContain("query-records");
+    expect(err.hint).not.toContain("query-notes");
+    expect(err.record_id).toBe(read.id);
+    const old = await c.refused("update-note", { id: path, metadata: { other: 3 }, if_updated_at: read.updatedAt });
+    expect(old.hint).toContain("query-notes"); // the old tool's words, as 0.8 gave them
+    expect(old.note_id).toBe(read.id);
     await c.close();
   });
 

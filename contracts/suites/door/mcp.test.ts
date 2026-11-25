@@ -70,16 +70,22 @@ describe("the vault over MCP", () => {
       const seen = one.updatedAt ?? one.note?.updatedAt ?? one.notes?.[0]?.updatedAt;
       const up = await c.call("update-note", { id: `${r}/one`, content: `again ${r}`, if_updated_at: seen });
       fp("mcp/update-note.result.shape", shape(up));
-      // A refused call: the JSON-RPC code and the structured `data` are what an app branches on; the message is
-      // for the model. The message's lead-in is recorded apart, since doors may word it differently.
-      const blind: any = await c.client.callTool({ name: "update-note", arguments: { id: `${r}/one`, content: "blind" } }).then(() => null, (e) => e);
-      expect(blind).toBeTruthy();
-      fp("mcp/refusal.blind-update", { code: blind.code ?? null, type: blind.data?.error_type ?? null, keys: Object.keys(blind.data ?? {}).sort(), hint: blind.data?.hint ? sha(blind.data.hint) : null });
-      fp("mcp/refusal.message-names-its-type", /\[precondition_required\]/.test(String(blind.message)));
-      const dup: any = await c.client.callTool({ name: "create-note", arguments: { path: `${r}/one`, content: "dup" } }).then(() => null, (e) => e);
-      fp("mcp/refusal.path-taken", { code: dup?.code ?? null, type: dup?.data?.error_type ?? null, keys: Object.keys(dup?.data ?? {}).sort() });
+      // A refused call (T-476, one way to refuse): an isError result whose structuredContent {error_type, message, ...}
+      // is what an app branches on; the message is for a person. Never a JSON-RPC error.
+      const blind: any = await c.client.callTool({ name: "update-note", arguments: { id: `${r}/one`, content: "blind" } });
+      expect(blind.isError).toBe(true);
+      expect(blind.structuredContent?.error_type).toBe("precondition_required");
+      expect(JSON.parse(blind.content[0].text)).toEqual(blind.structuredContent);
+      const refusalFp = (x: any) => ({ isError: x?.isError ?? false, type: x?.structuredContent?.error_type ?? null, keys: Object.keys(x?.structuredContent ?? {}).sort() });
+      fp("mcp/refusal.blind-update", { ...refusalFp(blind), hint: blind.structuredContent?.hint ? sha(blind.structuredContent.hint) : null });
+      fp("mcp/refusal.message-is-plain", !/^\[/.test(String(blind.structuredContent?.message)));
+      const dup: any = await c.client.callTool({ name: "create-note", arguments: { path: `${r}/one`, content: "dup" } });
+      fp("mcp/refusal.path-taken", refusalFp(dup));
       const none: any = await c.client.callTool({ name: "query-notes", arguments: { id: `${r}/nope` } });
-      fp("mcp/query-notes.no-such-note", { isError: none.isError ?? false, shape: shape(JSON.parse(none.content?.[0]?.text ?? "null")) });
+      expect(none.structuredContent?.error_type).toBe("not_found");
+      fp("mcp/query-notes.no-such-note", refusalFp(none));
+      const unknown: any = await c.client.callTool({ name: "no-such-tool", arguments: {} });
+      fp("mcp/refusal.unknown-tool", refusalFp(unknown));
       const info = await c.call("vault-info", {});
       fp("mcp/vault-info.result.keys", Object.keys(info).sort());
       const tags = await c.call("list-tags", {});
