@@ -2907,7 +2907,7 @@ tokens keep the path-only behavior.
 ### Attachment tickets (vault#611; both doors)
 
 MCP tool args are model-emitted, so a base64 upload through a tool call is
-effectively impossible past a few hundred KB. The `request-attachment-upload`
+small (`add-attachment`, below, takes up to 24 KiB). The `request-attachment-upload`
 / `request-attachment-download` MCP tools (`core/src/mcp.ts`) mint a
 short-lived, single-use, capability-in-URL ticket instead of moving bytes
 through the tool call itself — a runtime's shell spends the ticket directly
@@ -2981,10 +2981,54 @@ a runtime that can reach that host. Sandboxed runtimes often can't:
 - **The API code-execution tool** has no internet access, so its sandbox
   can't spend a ticket at all.
 
-In those runtimes, `read-attachment` still reads text and images into the
+In those runtimes, `add-attachment` (below) stores a small file through the
+MCP call itself, `read-attachment` reads text and images into the
 conversation, and text can be written as a record (`create-note`, or
 `create-record` on bun's 0.9 list). See Anthropic's
 [network settings for file creation](https://support.claude.com/en/articles/12111783-create-and-edit-files-with-claude).
+
+### A file in the call: `add-attachment` (T-476)
+
+`add-attachment {record, file, transcribe?}` (MCP, `vault:write`) stores a
+file whose bytes ride in the tool call, so it works wherever the MCP call
+does, sandbox or not. `file` is the FileInput object of MCP's file-transfer
+extension (`io.modelcontextprotocol/files`, draft):
+
+```json
+{ "id": "f1", "name": "notes.pdf", "mimeType": "application/pdf", "size": 18213,
+  "digest": { "algorithm": "sha-256", "value": "<base64url, no padding; hex also taken>" },
+  "data": "<RFC 4648 base64; line breaks ignored>" }
+```
+
+- Checked before anything is stored: `size` must be the decoded length
+  (`size_mismatch`), the SHA-256 must match `digest` (`digest_mismatch`: the
+  base64 was copied wrong), and the file must be at most 24 KiB
+  (`inline_too_large`, refused on the declared size and on the base64's length
+  before decoding; its hint names `attachment-url`). A file without `data`,
+  an empty file, a record that isn't there or is outside a tag scope
+  (`not_found`) and active content (`.html`, `.svg`, `.js` … by name, or
+  `text/html` and the like by type when there is no name:
+  `blocked_upload_extension`) are refused too.
+- Then it is stored by the same writer as a spent upload ticket (bun:
+  `storeTicketUpload` in `src/attachment-tickets.ts`), with the same
+  transcription decision. Returns
+  `{attachment: {id, path, mime_type, size}, record}`.
+- **The cap is measured, not guessed.** A model fills `data` by typing the
+  base64, at about one output token per character. On 2026-11-24 Claude Opus
+  retyped 16, 24 and 32 KiB of random bytes into one tool argument, every byte
+  right. 24 KiB is the cap. A bigger file goes through `attachment-url` from a runtime
+  that can reach the ticket host.
+- **`x-mcp-file`.** The `file` schema carries the extension's marker,
+  `{"x-mcp-file": {"maxSize": 24576}}`, only for a `tools/list` request whose
+  `_meta` declares the extension
+  (`io.modelcontextprotocol/clientCapabilities.extensions["io.modelcontextprotocol/files"]`).
+  Other clients get the same object unmarked, which an AI can fill itself: the
+  spec asks a host not to show a marked schema to a model that types its
+  arguments. No out-of-band upload yet (the extension's `upload`); a host
+  that transfers files itself sends them inline.
+- The account door (`/account/mcp`) doesn't list it: an AI stores a file
+  through the vault it is connected to (the writer's tool list there keeps
+  the 4,000-token budget).
 
 ### MCP
 
@@ -3001,7 +3045,7 @@ enforced inside the MCP layer; the same `vault:read` / `vault:write` /
 | Verb | Tools |
 |---|---|
 | `read` | `query-notes`, `list-tags`, `find-path`, `vault-info` (get/stats), `doctor`, `request-attachment-download`¹ |
-| `write` (additive over read) | `create-note`, `update-note`, `delete-note`, `request-attachment-upload`¹ |
+| `write` (additive over read) | `create-note`, `update-note`, `delete-note`, `request-attachment-upload`¹, `add-attachment`¹ |
 | `admin` (additive over write) | `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`, `manage-token`, `vault-info` (description update) |
 
 ¹ Conditionally appended (vault#611) — present only when the door wires an
