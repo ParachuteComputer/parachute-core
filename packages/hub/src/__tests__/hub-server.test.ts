@@ -7213,10 +7213,11 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
       expect(getRes.headers.get("access-control-allow-origin")).toBe("*");
 
       const body = (await getRes.json()) as Record<string, unknown>;
-      // Names the /mcp endpoint as the resource, and advertises hub's set —
-      // including admin, which the forwarded vault document omitted.
+      // Names the /mcp endpoint as the resource, and advertises hub's set
+      // (read and write; vault admin is left out on purpose since T-476).
       expect(String(body.resource)).toMatch(/\/mcp$/);
-      expect(body.scopes_supported as string[]).toContain("vault:admin");
+      expect(body.scopes_supported as string[]).toContain("vault:write");
+      expect(body.scopes_supported as string[]).not.toContain("vault:admin");
 
       // The decisive assertion: the vault daemon is never consulted.
       expect(upstream.requests().length).toBe(0);

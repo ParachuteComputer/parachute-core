@@ -561,6 +561,12 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
       // to ask for. Discovery advertises the ordinary surface; account-wide
       // authority is opt-in by intent, not by catalog-copying.
       .filter((scope) => !scope.toLowerCase().startsWith("account:"))
+      // Vault admin, the same way (T-476 claudereal): claude.ai requested `vault:admin` because it was listed, so every
+      // Claude connection asked for the vault's schema, settings, triggers, backup and key minting. It stays
+      // requestable: an app that needs it asks by name, and the consent page offers it unticked under "Grant
+      // additional access", so the person who wants Claude to manage tags ticks it there. Parachute Cloud never
+      // listed it; now both doors say the same.
+      .filter((scope) => !isVaultAdminScope(scope))
       .filter((scope) => {
         for (const [prefix, short] of OPTIONAL_MODULE_SCOPES) {
           if (scope.startsWith(prefix) && !installedShorts.has(short)) return false;
@@ -568,6 +574,12 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
         return true;
       })
   );
+}
+
+/** `vault:admin` or `vault:<name>:admin`, any casing. */
+function isVaultAdminScope(scope: string): boolean {
+  const parts = scope.toLowerCase().split(":");
+  return parts[0] === "vault" && parts[parts.length - 1] === "admin" && (parts.length === 2 || parts.length === 3);
 }
 
 /**
@@ -580,7 +592,10 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
  * service that doesn't know hub's scope set. Two consequences, both observed
  * live:
  *
- *   - **`vault:admin` was missing.** Vault's root PRM hard-codes
+ *   - **`vault:admin` was missing.** (T-476 took it out again on purpose: see
+ *     `advertisedScopes`. Admin stays reachable over MCP through the consent
+ *     page's unticked "additional access" box, not through the catalog.)
+ *     Vault's root PRM hard-codes
  *     `[read, write]` on the reasoning that "admin is an operator concern, not
  *     something the consent picker offers". That reasoning predates the
  *     2026-05-29 single-consent change, which made per-vault
@@ -2041,7 +2056,15 @@ export function grantableExtraScopes(
   userId: string,
   opts: { userIsAdmin: boolean; requested: readonly string[]; vaultName?: string | undefined },
 ): string[] {
-  const v = opts.vaultName;
+  // An ask already named for one vault (a connector at `/vault/<name>/mcp`) has no picker to bind an unnamed extra,
+  // so ticking `vault:admin` there ended on "Pick a vault" (T-476): name the extras for that vault.
+  const askedVaults = new Set(
+    opts.requested.flatMap((s) => {
+      const parts = s.split(":");
+      return parts.length === 3 && parts[0] === "vault" && parts[1] !== "*" ? [parts[1]!] : [];
+    }),
+  );
+  const v = opts.vaultName ?? (askedVaults.size === 1 ? [...askedVaults][0] : undefined);
   // The picker is the only path to `account:vaults`. Offering it as an extra
   // next to the client's vault scopes hits `accountVaultsCombinedWithOtherScopes`
   // at mint — a checkbox that looks grantable and then bounces the whole

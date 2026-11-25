@@ -128,7 +128,7 @@ describe("authorizationServerMetadata", () => {
     // closes #68 — scopes_supported populated from FIRST_PARTY_SCOPES
     const scopesSupported = body.scopes_supported as string[];
     expect(scopesSupported).toContain("vault:read");
-    expect(scopesSupported).toContain("vault:admin");
+    expect(scopesSupported).not.toContain("vault:admin"); // T-476: requestable, not advertised
     expect(scopesSupported).toContain("scribe:transcribe"); // scribe is in the fixture manifest
     // hub:admin + scribe:admin are operator-only (non-requestable) — never advertised (2026-06-30)
     expect(scopesSupported).not.toContain("hub:admin");
@@ -184,7 +184,7 @@ describe("authorizationServerMetadata", () => {
     expect(scopesSupported).toContain("mymodule:do-thing");
     // First-party still advertised — no regression
     expect(scopesSupported).toContain("vault:read");
-    expect(scopesSupported).toContain("vault:admin");
+    expect(scopesSupported).not.toContain("vault:admin");
     // NON_REQUESTABLE filter applies even when the scope is declared:
     // host-* AND the service-admin scopes (hub:admin/scribe:admin) are filtered.
     expect(scopesSupported).not.toContain("parachute:host:admin");
@@ -224,7 +224,7 @@ describe("authorizationServerMetadata", () => {
     const scopes = ((await res.json()) as Record<string, unknown>).scopes_supported as string[];
     // core scopes survive
     expect(scopes).toContain("vault:read");
-    expect(scopes).toContain("vault:admin");
+    expect(scopes).not.toContain("vault:admin");
     // hub:admin is operator-only (non-requestable) — never advertised
     expect(scopes).not.toContain("hub:admin");
     // uninstalled optional-module scopes are dropped
@@ -331,9 +331,13 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
       loadServicesManifest: fixtureLoadServicesManifest,
     });
 
-  test("advertises vault:admin — the regression that made tag editing unreachable over MCP", async () => {
+  // T-476 claudereal: claude.ai requests every scope listed, so a listed admin was every Claude connection's ask. Admin
+  // stays reachable over MCP through the consent page's unticked extras box ("consent as a browser submits it" below).
+  test("advertises vault read and write, not vault admin", async () => {
     const body = (await call().json()) as Record<string, unknown>;
-    expect(body.scopes_supported as string[]).toContain("vault:admin");
+    expect(body.scopes_supported as string[]).toContain("vault:read");
+    expect(body.scopes_supported as string[]).toContain("vault:write");
+    expect(body.scopes_supported as string[]).not.toContain("vault:admin");
   });
 
   test("names the /mcp endpoint as the resource, not the bare origin", async () => {
@@ -464,7 +468,7 @@ describe("handleAuthorizeGet", () => {
   // screen via `client.sameHub`. An unnamed `vault:read` request from a
   // same-hub client falls through to consent (the auto-approve gate requires
   // `!hasUnnamedVault`), so we can assert the marker on the GET render.
-  test("renders the EXTERNAL trust marker for a third-party DCR client", async () => {
+  test("renders the self-registered trust marker for a third-party DCR client", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -496,7 +500,7 @@ describe("handleAuthorizeGet", () => {
       // Element form — the `.badge-trust-*` CSS class names are always in the
       // inlined <style>; the rendered ELEMENT only appears when the marker fires.
       expect(html).toContain('class="badge badge-trust-external"');
-      expect(html).toContain("third-party app that registered itself");
+      expect(html).toContain("It registered itself when you connected it.");
       expect(html).not.toContain('class="badge badge-trust-same-hub"');
     } finally {
       cleanup();
@@ -575,7 +579,7 @@ describe("handleAuthorizeGet", () => {
     }
   }
 
-  test("Parachute's own app on loopback: says it's Parachute's, no External, no company line (T-476)", async () => {
+  test("Parachute's own app on loopback: says it's Parachute's, not self-registered, no company line (T-476)", async () => {
     const html = await consentFor("Parachute", "http://127.0.0.1:47219/oauth/callback");
     expect(html).toContain("Parachute's app on this device: it returns only here.");
     expect(html).not.toContain('class="badge badge-trust-external"');
@@ -589,7 +593,7 @@ describe("handleAuthorizeGet", () => {
     expect(html).not.toContain("company that runs it");
   });
 
-  test("Claude on loopback stays External with the company line (T-476: loopback alone isn't Parachute's)", async () => {
+  test("Claude on loopback stays self-registered with the company line (T-476: loopback alone isn't Parachute's)", async () => {
     const html = await consentFor("Claude Code", "http://127.0.0.1:53682/callback");
     expect(html).toContain('class="badge badge-trust-external"');
     expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
@@ -598,7 +602,7 @@ describe("handleAuthorizeGet", () => {
 
   // Claude Code registers as "Claude Code (<server>)", and the hub's own commands name the server parachute or
   // parachute-<vault>: the name contains the word, the redirect is loopback, and it is still not Parachute's app.
-  test("Claude Code connected as 'parachute' stays External with the company line (T-476)", async () => {
+  test("Claude Code connected as 'parachute' stays self-registered with the company line (T-476)", async () => {
     for (const name of ["Claude Code (parachute)", "Claude Code (parachute-work)", "Cursor (parachute)", "Parachute Notes"]) {
       const html = await consentFor(name, "http://localhost:53682/callback");
       expect(html).toContain('class="badge badge-trust-external"');
@@ -12852,7 +12856,7 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
   const attr = (tag: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1];
   const unescape = (s: string) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
   /** The fields a browser posts from the consent form, with these scope boxes unticked. */
-  function browserFields(html: string, untick: string[]): [string, string][] {
+  function browserFields(html: string, untick: string[], tick: string[] = []): [string, string][] {
     const start = html.indexOf('class="auth-form consent-form"');
     expect(start).toBeGreaterThan(-1);
     const form = html.slice(start, html.indexOf("</form>", start));
@@ -12866,7 +12870,7 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
       else if ((type === "checkbox" || type === "radio") && /\schecked\b/.test(tag)) {
         if (name === "granted_scope" && untick.includes(value)) continue;
         out.push([name, value]);
-      }
+      } else if (type === "checkbox" && tick.includes(value)) out.push([name, value]);
     }
     for (const [, attrs, body] of form.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
       const name = attr(attrs ?? "", "name");
@@ -12875,18 +12879,30 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
     }
     return out;
   }
-  async function consent(scope: string, untick: string[], resource?: string): Promise<{ scope: string } | { denied: string }> {
+  async function consent(
+    scope: string,
+    untick: string[],
+    resource?: string,
+    opts: { tick?: string[]; pick?: string; app?: { name: string; redirect: string }; seen?: (html: string) => void } = {},
+  ): Promise<{ scope: string } | { denied: string }> {
     const { db, cleanup } = await makeDb();
+    const redirect = opts.app?.redirect ?? "https://app.example/cb";
     try {
       const owner = await createUser(db, "owner", "pw");
       const session = createSession(db, { userId: owner.id });
-      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const reg = registerClient(db, { redirectUris: [redirect], status: "approved", ...(opts.app ? { clientName: opts.app.name } : {}) });
       const pk = makePkce();
-      const params = { client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", response_type: "code", scope, code_challenge: pk.challenge, code_challenge_method: "S256", ...(resource ? { resource } : {}) };
+      const params = { client_id: reg.client.clientId, redirect_uri: redirect, response_type: "code", scope, code_challenge: pk.challenge, code_challenge_method: "S256", ...(resource ? { resource } : {}) };
       const page = handleAuthorizeGet(db, new Request(authorizeUrl(params), { headers: { cookie: cookie(session.id) } }), deps);
       expect(page.status).toBe(200);
+      const html = await page.text();
+      opts.seen?.(html);
       const form = new URLSearchParams();
-      for (const [k, v] of browserFields(await page.text(), untick)) form.append(k, v);
+      for (const [k, v] of browserFields(html, untick, opts.tick)) form.append(k, v);
+      if (opts.pick) {
+        expect(html).toContain(`name="vault_pick" value="${opts.pick}"`);
+        form.set("vault_pick", opts.pick);
+      }
       form.append("approve", "yes");
       const res = await handleAuthorizePost(
         db,
@@ -12900,7 +12916,7 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
         db,
         new Request(`${ISSUER}/oauth/token`, {
           method: "POST",
-          body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", code_verifier: pk.verifier, ...(resource ? { resource } : {}) }),
+          body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: reg.client.clientId, redirect_uri: redirect, code_verifier: pk.verifier, ...(resource ? { resource } : {}) }),
           headers: { "content-type": "application/x-www-form-urlencoded" },
         }),
         deps,
@@ -12916,8 +12932,41 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
   test("SECURITY: an AI's connector asks read, write and admin; the person unticks admin: the token holds no admin", async () => {
     expect(await consent("vault:work:read vault:work:write vault:work:admin", ["vault:work:admin"], MCP)).toEqual({ scope: "vault:work:read vault:work:write" });
   });
-  test("left as drawn, what was asked is granted", async () => {
-    expect(await consent("vault:work:read vault:work:write vault:work:admin", [], MCP)).toEqual({ scope: "vault:work:admin vault:work:read vault:work:write" });
+  // T-476 claudereal: claude.ai asks for every scope a vault advertises, admin included, and a person who just presses
+  // Approve gave Claude an admin key (schema, settings, triggers, backup, minting tokens). Read and write come ticked;
+  // admin waits for the person's own tick.
+  test("SECURITY: left as drawn, an AI's connector that asks read, write and admin gets read and write", async () => {
+    expect(await consent("vault:work:read vault:work:write vault:work:admin", [], MCP)).toEqual({ scope: "vault:work:read vault:work:write" });
+  });
+  test("the person who ticks admin grants it", async () => {
+    expect(await consent("vault:work:read vault:work:write vault:work:admin", [], MCP, { tick: ["vault:work:admin"] })).toEqual({
+      scope: "vault:work:admin vault:work:read vault:work:write",
+    });
+  });
+  test("SECURITY: an ask for admin alone, approved as drawn, is a denial, never admin", async () => {
+    expect(await consent("vault:work:admin", [], MCP)).toEqual({ denied: "access_denied" });
+  });
+  test("admin offered as additional access starts unticked and is granted only when ticked", async () => {
+    let html = "";
+    expect(await consent("vault:work:read vault:work:write", [], MCP, { seen: (h) => (html = h) })).toEqual({ scope: "vault:work:read vault:work:write" });
+    // Named for the vault the app asked for: an unnamed `vault:admin` here had no vault picker to bind it, and ticking
+    // it was a "Pick a vault" error page.
+    expect(html).toMatch(/<input type="checkbox" name="extra_scope" value="vault:work:admin" \/>/);
+    expect(await consent("vault:work:read vault:work:write", [], MCP, { tick: ["vault:work:admin"] })).toEqual({
+      scope: "vault:work:admin vault:work:read vault:work:write",
+    });
+  });
+  // hub#789 listed admin so tag-schema work was reachable over MCP; with admin out of the catalog it is reachable here.
+  test("at the root /mcp door, the admin extra binds to the vault the person picks", async () => {
+    expect(await consent("vault:read vault:write", [], undefined, { tick: ["vault:admin"], pick: "work" })).toEqual({
+      scope: "vault:work:admin vault:work:read vault:work:write",
+    });
+  });
+  // Parachute's own app asks for a vault's admin only when the person pressed Manage in it (the app's manageScope), and
+  // returns only to this device: an unticked box there would make Manage fail for everyone who just approves.
+  test("Parachute's own app on this device keeps the admin it asked for ticked", async () => {
+    const app = { name: "Parachute", redirect: "http://127.0.0.1:47219/oauth/callback" };
+    expect(await consent("vault:work:admin", [], MCP, { app })).toEqual({ scope: "vault:work:admin" });
   });
   test("SECURITY: account-wide admin starts unticked; Approve without ticking it is a denial, not a grant", async () => {
     expect(await consent("account:self:admin", [])).toEqual({ denied: "access_denied" });

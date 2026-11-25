@@ -231,9 +231,9 @@ describe("add-attachment", () => {
     expect(marked.inputSchema.properties.file["x-mcp-file"]).toEqual({ maxSize: MAX_INLINE_ATTACHMENT_BYTES });
   });
 
-  test("the connect-time brief tells a writer to use it when it holds the bytes, and a reader nothing about it", async () => {
+  test("the connect-time brief tells a writer to use it when it can't reach the host, and a reader nothing about it", async () => {
     const vault = freshVault("addatt-brief");
-    expect(await getServerInstruction(vault, auth(WRITE))).toContain("`add-attachment` stores a file of up to 80 KiB sent in the call");
+    expect(await getServerInstruction(vault, auth(WRITE))).toContain("store a file with `add-attachment`: up to 80 KiB sent in the call");
     expect(await getServerInstruction(vault, auth(["vault:read"]))).not.toContain("add-attachment");
   });
 });

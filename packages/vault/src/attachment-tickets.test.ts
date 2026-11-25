@@ -552,6 +552,9 @@ describe("attachment tickets — discoverability", () => {
     expect(md).toContain("## Attachments");
     // T-407: this door lists attachment-url (0.9's one ticket tool) and the record tools, so its brief names them.
     expect(md).toContain("`attachment-url` gives a one-use URL");
+    // T-476 claudereal: claude.ai's sandbox can't reach the vault's host, so the brief says which way works where.
+    expect(md).toContain("for a client that can reach this host");
+    expect(md).toContain("If you can't reach this host (a code sandbox, as in claude.ai), store a file with `add-attachment`");
     expect(md).not.toContain("request-attachment-upload");
     expect(md).toContain("`include_attachments: true` on `query-records` lists a record's attachments.");
   });

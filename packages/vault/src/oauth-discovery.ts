@@ -48,7 +48,9 @@ import { SCOPE_READ, SCOPE_WRITE } from "./scopes.ts";
  * works regardless. See scopes.ts for enforcement.
  */
 function scopesSupportedFor(vaultName: string): string[] {
-  return [`vault:${vaultName}:read`, `vault:${vaultName}:write`, `vault:${vaultName}:admin`];
+  // Read and write only (T-476): clients such as claude.ai request everything listed here, so a listed admin became
+  // every connector's ask. Admin is still requestable by name, and the consent page offers it unticked.
+  return [`vault:${vaultName}:read`, `vault:${vaultName}:write`];
 }
 
 /**

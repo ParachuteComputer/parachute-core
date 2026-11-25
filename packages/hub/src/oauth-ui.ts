@@ -441,7 +441,7 @@ export function renderConsent(props: ConsentViewProps): string {
           .map((wire, i) =>
             levelsDecide(wire)
               ? `${renderScopeRow(wire, displayedScopes[i] ?? wire, false)}<input type="hidden" name="granted_scope" value="${escapeHtml(wire)}" />`
-              : renderScopeRow(wire, displayedScopes[i] ?? wire),
+              : renderScopeRow(wire, displayedScopes[i] ?? wire, true, parachuteApp !== undefined),
           )
           .join("\n");
   // 0.9.1 (SPEC §3.4): a vault grant reaches the whole vault at its level, and what the app reads leaves the box.
@@ -528,8 +528,8 @@ export function renderConsent(props: ConsentViewProps): string {
             <span class="trust-marker-text">Registered through this hub.</span>
           </p>`
         : `<p class="trust-marker trust-marker-external">
-            <span class="badge badge-trust-external">External</span>
-            <span class="trust-marker-text">A third-party app that registered itself. Approve only if you recognise it.</span>
+            <span class="badge badge-trust-external">Self-registered</span>
+            <span class="trust-marker-text">It registered itself when you connected it. Approve if you started this connection.</span>
           </p>`;
   const body = `
     <div class="card">
@@ -1139,7 +1139,7 @@ export function renderUnknownClient(props: UnknownClientViewProps): string {
  * missed it by omitting `displayVault`, so no substitution occurred and the two
  * forms happened to coincide.
  */
-function renderScopeRow(scope: string, displayScope: string = scope, interactive = true): string {
+function renderScopeRow(scope: string, displayScope: string = scope, interactive = true, adminTicked = false): string {
   // Special-case the `<TBD>` placeholder substituted by `canonicalConsentScope`
   // when the consent picker hasn't bound a vault yet — `explainScope` doesn't
   // match it because `<` / `>` aren't in the vault-name charset, but the
@@ -1184,13 +1184,16 @@ function renderScopeRow(scope: string, displayScope: string = scope, interactive
   // An account-wide scope gets an explicit consequence line, not just a colour.
   // Colour alone is invisible to a screen reader and to anyone who doesn't
   // know the convention, and this is the decision most worth slowing down.
-  const riskNote = accountWideRiskNote(lookup, risk);
+  const riskNote = scopeRiskNote(lookup, explanation, risk);
   // One checkbox per requested scope — granular consent. Pre-checked for
   // ordinary scopes (the app asked for them and approving is the common case),
   // but a `high` tier scope starts UNCHECKED: account-wide authority should be
   // something a user reaches for deliberately, not something they inherit by
   // clicking Approve on a list an app composed.
-  const preChecked = risk === "high" ? "" : " checked";
+  // Admin starts unticked too (T-476 claudereal): claude.ai asks for every scope a vault advertises, so a person who
+  // pressed Approve gave Claude the vault's schema, settings, triggers, backup and key minting. The one exception is
+  // Parachute's own app (`adminTicked`), which asks for a vault's admin only when the person pressed Manage in it.
+  const preChecked = risk === "high" || (explanation.level === "admin" && !adminTicked) ? "" : " checked";
   // Read-only where nothing is chosen here (the approve-client page: scopes are chosen at the consent after it).
   const box = interactive ? `<input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}"${preChecked} />` : "";
   // a row that chooses nothing isn't a label: no pointer, nothing to click
@@ -1247,7 +1250,7 @@ function renderGrantableExtras(extras: readonly string[], expanded: boolean): st
                 ${badge}
               </span>
               <span class="scope-label">${escapeHtml(label)}</span>
-              ${accountWideRiskNote(scope, risk)}
+              ${e ? scopeRiskNote(scope, e, risk) : accountWideRiskNote(scope, risk)}
             </span>
           </label>
         </li>`;
@@ -1258,6 +1261,16 @@ function renderGrantableExtras(extras: readonly string[], expanded: boolean): st
       <p class="extras-note">The app didn't request these. Only grant what you actually want it to have.</p>
       <ul class="scopes-list">${rows}</ul>
     </details>`;
+}
+
+/**
+ * The consequence line under a scope: account-wide reach (`accountWideRiskNote`), else, for an admin scope, that it
+ * is powerful and why. Words, not only colour, for the same reasons as the account-wide line.
+ */
+function scopeRiskNote(scope: string, explanation: ScopeExplanation, risk: "low" | "elevated" | "high"): string {
+  const wide = accountWideRiskNote(scope, risk);
+  if (wide || explanation.level !== "admin") return wide;
+  return `<span class="scope-risk-note scope-risk-admin"><strong>Powerful.</strong> The app could change how the vault works and make keys of its own. Tick it only if you want this app to manage the vault.</span>`;
 }
 
 /**
@@ -1666,6 +1679,7 @@ const STYLES = `
     font-size: 0.85em;
     color: ${PALETTE.danger};
   }
+  .scope-risk-admin { color: ${PALETTE.caution}; }
 
   .vault-picker {
     margin: 0 0 1.25rem;
@@ -1906,9 +1920,9 @@ const STYLES = `
     text-transform: none;
   }
 
-  /* hub#314 — same-hub vs external trust marker on the consent header. The
-     first-party badge uses the accent (calm/trusted); external uses the danger
-     tint so a third-party DCR client stands out without being alarmist. */
+  /* hub#314 — same-hub vs self-registered trust marker on the consent header. The
+     first-party badge uses the accent; a self-registered app gets a plain neutral
+     badge (T-476: red read as a warning about every AI connector). */
   .trust-marker {
     display: flex;
     align-items: baseline;
@@ -1920,7 +1934,7 @@ const STYLES = `
   }
   .trust-marker-text { flex: 1; min-width: 12rem; }
   .badge-trust-same-hub { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
-  .badge-trust-external { background: ${PALETTE.dangerSoft}; color: ${PALETTE.danger}; }
+  .badge-trust-external { background: ${PALETTE.bgSoft}; color: ${PALETTE.fgMuted}; }
 
   @media (max-width: 480px) {
     main { padding: 0.75rem; }
