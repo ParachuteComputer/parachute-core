@@ -281,7 +281,7 @@ export const RECORD_DESCRIPTIONS: Readonly<Record<string, string>> = {
 - One record: \`id\` (id, path or title). Lists leave the ${BODY} out unless \`include_${BODY}: true\`.
 - Filters combine (AND). \`type\` matches a type and its subtypes (\`event\` finds \`event/meeting\`); \`tag\` matches a label. \`${FIELDS}\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Each record has \`id\`, \`path\` (its last part is the name; there is no \`title\`), \`types\` (what it is), \`tags\` (labels), \`${FIELDS}\`, a \`${BODY}\` and \`updatedAt\`.
-- Returns JSON: one record for \`id\`; an array of records, or \`{records, next_cursor?, warnings?}\` with \`cursor\` or warnings; \`[{group, value}]\` with \`aggregate\`. An empty page means done.
+- Returns JSON: one record for \`id\` (\`{error, error_type}\` if it's missing); an array of records, or \`{records, next_cursor?, warnings?}\` with \`cursor\` or warnings; \`[{group, value}]\` with \`aggregate\`. An empty page means done.
 - ${HYBRID_TEXT.line}
 Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted too. ${HELP("query-records")}`,
   "create-record": `Create a record, or several with \`records: [...]\`. \`types\` names its types (existing types or new names); \`tags\` adds labels. If \`path\` is taken, \`if_exists\` decides: error (default), ignore, update (merge into it) or replace. ${HELP("create-record")} If no existing type fits what the record is, name a new type for it rather than using the nearest one.`,

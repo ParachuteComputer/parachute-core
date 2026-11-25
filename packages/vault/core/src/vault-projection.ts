@@ -368,13 +368,10 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
  * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
  */
 export const LIVE_PAGE_BLOCK =
-  "A live page reads this vault each time someone opens it. Declare only the tools it calls: `query-records` to read, " +
-  "`update-record` to change, `create-record` to add. Read with `watchTool` on `query-records`, filtered by `type`, " +
-  "`path_prefix` or `fields`; the reply is JSON: one record, an array, or `{records, next_cursor}`, and a missing " +
-  "record answers `{error, error_type: \"not_found\"}`. A record's name is the last part of its `path`. Write only on " +
-  "a click: `update-record {id, fields or body, if_updated_at: record.updatedAt}`, then `invalidate` the " +
-  "reads. A conflict means it changed elsewhere: read it again, never `force`. Writes need a viewer whose connection " +
-  "may write. Use this vault's own type and field names. Guide: https://parachute.computer/docs/use/claude-artifacts/";
+  "A Claude artifact over this vault reads with `watchTool` on `query-records` and writes on a click with " +
+  "`update-record` (`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again. It declares " +
+  "only the tools it calls. A reply is a record, an array, or an object with `records`. Guide: " +
+  "https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
   vaultName: string;
@@ -545,9 +542,9 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push("## Querying");
   lines.push("");
-  for (const hint of projection.query_hints) {
-    lines.push(`- \`${w(hint)}\``);
-  }
+  // T-476: one line, not the five hints (`vault-info` still returns them): query-records' own description, which
+  // every client reads with the tool list, says each filter, so the brief keeps its budget for what only it can say.
+  lines.push(w("`query-notes { type: \"X\" }` lists a type, subtypes too; the tool's description has every filter (`metadata` operators, `search`, `near`, `id`)."));
 
   lines.push("");
   lines.push("## Refreshing context");
