@@ -2,7 +2,8 @@ import { SEARCH_MODES } from "./search-query.js";
 import { HYBRID_TEXT } from "./hybrid.js";
 import { MIN_CONTENT_LENGTH } from "./content-range-constants.js";
 import { MAX_TICKET_UPLOAD_BYTES } from "./attachment/tickets.js";
-import { SHORT_TOOLS } from "./mcp-short.js";
+import { FILE_INPUT, SHORT_TOOLS } from "./mcp-short.js";
+import { MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.js";
 
 /**
  * Pure-data MCP tool manifest — the single source of truth for every core MCP
@@ -31,11 +32,12 @@ export type McpToolVerb = "read" | "write" | "admin";
 /**
  * Inclusion gate for a tool. `core` tools are always present;
  * `attachment-tickets` requires the caller wire an `attachmentTickets` seam;
- * `attachment-bytes` requires an `attachmentBytes` seam (see
+ * `attachment-bytes` requires an `attachmentBytes` seam; `attachment-store`
+ * requires the ticket seam's `storeUpload` (see
  * `GenerateMcpToolsOpts`). A front-of-house layer reads this to know which
  * tools a given runtime can actually back.
  */
-export type McpToolCondition = "core" | "attachment-tickets" | "attachment-bytes";
+export type McpToolCondition = "core" | "attachment-tickets" | "attachment-bytes" | "attachment-store";
 
 /** One pure-data tool entry. Mirrors the metadata half of `McpToolDef` (no `execute`/`resultContent`). */
 export interface McpToolManifestEntry {
@@ -797,6 +799,21 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         required: ["attachment_id"],
       },
       condition: "attachment-tickets",
+    },
+    {
+      name: "add-attachment",
+      requiredVerb: "write",
+      description: `Store a file on a record, its bytes in this call (T-476): for an agent that holds the file but whose runtime can't reach this vault's URL, such as a code sandbox. \`file\` is the FileInput object of MCP's file-transfer extension (io.modelcontextprotocol/files): \`id\` (any label), \`name\` (the file's name; its extension sets the stored type, and active content such as .html/.svg/.js is refused), \`mimeType\`, \`size\` (the exact decoded byte count), \`digest\` ({algorithm: "sha-256", value}: the SHA-256 of the bytes in base64url without padding, as the extension says, or in hex) and \`data\` (the bytes in RFC 4648 base64; line breaks are ignored). The size and the SHA-256 are checked before anything is stored: a mismatch is refused (\`size_mismatch\`, \`digest_mismatch\`), so a file copied wrong never lands. The limit is ${MAX_INLINE_ATTACHMENT_BYTES} bytes (${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB, what a model can type into one call); a bigger file is refused (\`inline_too_large\`): use attachment-url {action: "upload"} and PUT the bytes to its URL instead, which takes up to 100 MiB if your runtime can reach this host. Stored exactly as an upload ticket stores it; \`transcribe: true\` transcribes an audio file. Returns {attachment: {id, path, mime_type, size}, record}.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          record: { type: "string", description: "The record's id or path" },
+          file: FILE_INPUT,
+          transcribe: { type: "boolean", description: "Transcribe an audio file, as attachment-url's upload does" },
+        },
+        required: ["record", "file"],
+      },
+      condition: "attachment-store",
     },
     {
       name: "read-attachment",

@@ -1,4 +1,5 @@
-// 0.9's MCP shape (T-318 design §4): eleven tools for an admin, ten for a writer, six for a reader. manage-types folds
+// 0.9's MCP shape (T-318 design §4): eleven tools for an admin, ten for a writer, six for a reader, and add-attachment
+// for a writer and an admin since T-476 (a file sent in the call). manage-types folds
 // the five tag tools, attachment-url the two ticket tools, manage-keys renames manage-token, and query-records
 // {path_between} replaces find-path. The record tools (T-407: query-records, create-record, update-record,
 // delete-record, list-types) lead; the note-named tools they replace and the nine other old names stay listed and
@@ -7,9 +8,9 @@
 import { describe, expect, test } from "bun:test";
 import { mcp, pass, runId, safeFetch, services } from "../lib.ts";
 
-const ELEVEN = ["query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor", "read-attachment", "attachment-url", "manage-types", "manage-keys"];
+const ELEVEN = ["query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor", "read-attachment", "add-attachment", "attachment-url", "manage-types", "manage-keys"];
 // A writer sees manage-types (T-476, mcp/write-types): it may make a new type; every other action is admin's.
-const WRITER = ["query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor", "read-attachment", "attachment-url", "manage-types"];
+const WRITER = ["query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor", "read-attachment", "add-attachment", "attachment-url", "manage-types"];
 const READER = ["query-records", "list-types", "vault-info", "doctor", "read-attachment", "attachment-url"];
 const ALIASES = ["query-notes", "create-note", "update-note", "delete-note", "list-tags", "find-path", "update-tag", "rename-tag", "merge-tags", "delete-tag", "prune-schema", "request-attachment-upload", "request-attachment-download", "manage-token"];
 

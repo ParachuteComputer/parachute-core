@@ -27,7 +27,7 @@
 {"key":"account/vaults.item.version","value":"string"}
 {"key":"account/vaults.reply.envelope","value":["vaults"]}
 {"key":"annotations/account.read-only.tools","value":["doctor","find-path","list-access","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download"]}
-{"key":"annotations/destructive.tools","value":["create-note","create-record","delete-note","delete-record","delete-tag","manage-keys","manage-token","manage-types","merge-tags","prune-schema","rename-tag","update-note","update-record","update-tag","vault-info"]}
+{"key":"annotations/destructive.tools","value":["add-attachment","create-note","create-record","delete-note","delete-record","delete-tag","manage-keys","manage-token","manage-types","merge-tags","prune-schema","rename-tag","update-note","update-record","update-tag","vault-info"]}
 {"key":"annotations/read-only.tools","value":["attachment-url","doctor","find-path","list-tags","list-types","query-notes","query-records","read-attachment","request-attachment-download","vault-info"]}
 {"key":"connect/admin-scope","value":{"granted":"admin read write"}}
 {"key":"connect/admin-scope.advertised","value":true}
@@ -65,6 +65,13 @@
 {"key":"exit/file.pathless","value":{"name":"_unpathed/exit-fixture pathless note.md","text":"---\nid: <id>\ntags:\n  - exit/nested-tag\ncreated_at: <time>\nupdated_at: <time>\n---\nexit-fixture pathless note\n"}}
 {"key":"exit/file.vault.yaml.keys","value":["export_format_version","exported_at","name"]}
 {"key":"exit/http.headers","value":{"disposition":"attachment; filename=\"vault-<v>-<time>.tar\"","type":"application/x-tar"}}
+{"key":"files/add-attachment.annotations","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
+{"key":"files/add-attachment.refusal.digest","value":{"code":-32602,"field":"file.digest","type":"digest_mismatch"}}
+{"key":"files/add-attachment.refusal.no-record","value":{"code":-32602,"field":"id","type":"not_found"}}
+{"key":"files/add-attachment.refusal.size","value":{"code":-32602,"field":"file.size","type":"size_mismatch"}}
+{"key":"files/add-attachment.refusal.too-large","value":{"code":-32602,"field":"file.size","type":"inline_too_large"}}
+{"key":"files/add-attachment.result.shape","value":{"attachment":{"id":"string","mime_type":"string","path":"string","size":"number"},"record":"string"}}
+{"key":"files/add-attachment.schema","value":{"properties":{"file":{"properties":{"data":{"type":"string"},"digest":{"properties":{"algorithm":{"const":"sha-256"},"value":{"description":"base64url or hex","type":"string"}},"required":["algorithm","value"],"type":"object"},"id":{"type":"string"},"mimeType":{"type":"string"},"name":{"type":"string"},"size":{"type":"integer"}},"required":["id","mimeType","size","digest"],"type":"object"},"record":{"description":"Id or path","type":"string"},"transcribe":{"type":"boolean"}},"required":["record","file"],"type":"object"}}
 {"key":"files/attach.reply.shape","value":{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}}
 {"key":"files/attachments.list.shape","value":[{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}]}
 {"key":"files/detach.reply","value":{"shape":"null","status":204}}
@@ -83,6 +90,7 @@
 {"key":"files/upload.pdf","value":{"status":201}}
 {"key":"files/upload.reply.shape","value":{"mimeType":"string","path":"string","size":"number"}}
 {"key":"files/upload.txt","value":{"status":201}}
+{"key":"has/add-attachment","value":true}
 {"key":"has/export-key","value":true}
 {"key":"has/export-over-http","value":true}
 {"key":"has/multi-vault-door","value":true}
@@ -123,7 +131,11 @@
 {"key":"mcp/admin.capabilities","value":["tools"]}
 {"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
 {"key":"mcp/admin.server.name","value":"parachute-vault/<v>"}
-{"key":"mcp/admin.tool-count","value":25}
+{"key":"mcp/admin.tool-count","value":26}
+{"key":"mcp/admin.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
+{"key":"mcp/admin.tool.add-attachment.present","value":true}
+{"key":"mcp/admin.tool.add-attachment.schema","value":"87c472435e828ac5"}
+{"key":"mcp/admin.tool.add-attachment.words","value":"6f0ec94322addd54"}
 {"key":"mcp/admin.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.attachment-url.present","value":true}
 {"key":"mcp/admin.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
@@ -315,7 +327,11 @@
 {"key":"mcp/write.capabilities","value":["tools"]}
 {"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
 {"key":"mcp/write.server.name","value":"parachute-vault/<v>"}
-{"key":"mcp/write.tool-count","value":18}
+{"key":"mcp/write.tool-count","value":19}
+{"key":"mcp/write.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
+{"key":"mcp/write.tool.add-attachment.present","value":true}
+{"key":"mcp/write.tool.add-attachment.schema","value":"87c472435e828ac5"}
+{"key":"mcp/write.tool.add-attachment.words","value":"6f0ec94322addd54"}
 {"key":"mcp/write.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.attachment-url.present","value":true}
 {"key":"mcp/write.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
@@ -398,7 +414,7 @@
 {"key":"records/mcp.list-types.shape","value":{"count":"number","created_at":"string","description":"null","expanded_count":"number","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
 {"key":"records/mcp.manage-types","value":{"created_at":"string","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","tag":"string","updated_at":"string"}}
 {"key":"records/mcp.old-word-beside-new","value":{"code":-32602,"refused":true,"type":"invalid_query"}}
-{"key":"records/mcp.order","value":["query-records","create-record","update-record","delete-record","list-types","vault-info","doctor","read-attachment","attachment-url","manage-types","query-notes","create-note","update-note","delete-note","list-tags","find-path","update-tag","rename-tag","merge-tags","delete-tag","prune-schema","request-attachment-upload","request-attachment-download"]}
+{"key":"records/mcp.order","value":["query-records","create-record","update-record","delete-record","list-types","vault-info","doctor","read-attachment","add-attachment","attachment-url","manage-types","query-notes","create-note","update-note","delete-note","list-tags","find-path","update-tag","rename-tag","merge-tags","delete-tag","prune-schema","request-attachment-upload","request-attachment-download"]}
 {"key":"records/mcp.query-records.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/rest.create.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"city":"string"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]},"warnings":"undefined"}}
 {"key":"records/rest.create.status","value":201}

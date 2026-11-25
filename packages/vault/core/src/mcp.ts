@@ -66,6 +66,7 @@ import { findRetypeConflicts, retypeHint } from "./conformance.js";
 import { MigrateRequestError, runMigrateRequest } from "./migrate-tag-field.js";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
+  BLOCKED_ATTACHMENT_MIME_EXTENSIONS,
   ATTACHMENT_MIME_TYPES,
   sanitizeAttachmentExtension,
   mimeForAttachmentExtension,
@@ -82,6 +83,7 @@ import {
   MAX_ATTACHMENT_IMAGE_BYTES,
   type AttachmentBytesProvider,
 } from "./attachment/bytes-provider.js";
+import { MAX_INLINE_ATTACHMENT_BYTES, readInlineFile } from "./attachment/inline.js";
 import { attachNearTypeWarnings, foldTypeFilter, holdTypes, markTypes, nearSchemaWarnings, nearTypeWarnings, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
 
 /**
@@ -671,6 +673,12 @@ export interface GenerateMcpToolsOpts {
     scopedTags?: string[];
     /** The session's grant, stamped on each ticket so its spend re-checks that it is still in force. */
     grant?: string;
+    /**
+     * Store an upload's bytes exactly as this door's ticket spend does (the same writer, scope and grant re-check,
+     * transcription decision and attachment row). When provided, `generateMcpTools` lists `add-attachment`, which
+     * takes the bytes in the call (T-476); omitted, that tool is absent. Returns the new attachment row.
+     */
+    storeUpload?: (ticket: AttachmentTicket, bytes: Uint8Array) => Promise<Attachment>;
   };
   /**
    * `AttachmentBytesProvider` seam (Wave 2 model lane — D10, same "tools
@@ -3190,6 +3198,65 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     );
   }
 
+  // add-attachment (T-476): the bytes ride in the call as an MCP file-transfer FileInput, for an agent whose runtime
+  // can't reach the ticket URL. Checked (size, SHA-256, the cap) before anything is stored; then the same policy as
+  // an upload ticket's mint (write verb, the note in scope, the extension blocklist) and the same writer as its spend.
+  const storeUpload = ticketSeam?.storeUpload;
+  if (ticketSeam && storeUpload) {
+    executorDefs.push({
+      name: "add-attachment",
+      execute: async (params) => {
+        const noteRef = params.record;
+        if (typeof noteRef !== "string" || noteRef.trim() === "") {
+          throw structuredError("`record` is required", {
+            error_type: "missing_required_field",
+            field: "record",
+            how_to: "pass the record's id or path",
+          });
+        }
+        const file = await readInlineFile(params.file, MAX_INLINE_ATTACHMENT_BYTES);
+        const note = requireNote(db, noteRef, resolveVisibility);
+        if (ticketSeam.noteVisible && !(await ticketSeam.noteVisible(note))) {
+          throw structuredError(`Note not found: "${noteRef}"`, { error_type: "not_found", field: "record" });
+        }
+        const typed = file.mimeType.split(";")[0]!.trim().toLowerCase();
+        const fromName = file.name ? sanitizeAttachmentExtension(file.name) : "";
+        // No name: an extension from the media type, so the stored file is served as what it is.
+        const ext = fromName || BLOCKED_ATTACHMENT_MIME_EXTENSIONS[typed] || (Object.entries(ATTACHMENT_MIME_TYPES).find(([, m]) => m === typed)?.[0] ?? "");
+        if (BLOCKED_ATTACHMENT_EXTENSIONS.has(ext) || BLOCKED_ATTACHMENT_MIME_EXTENSIONS[typed]) {
+          throw structuredError(`File type ${ext} not allowed (active/executable content)`, {
+            error_type: "blocked_upload_extension",
+            field: fromName ? "file.name" : "file.mimeType",
+            extension: ext,
+            how_to: "rename with a non-executable extension, or store the content as record text instead",
+          });
+        }
+        // A curated extension's own type wins (as at the REST upload); otherwise the type the caller gave.
+        const mimeType = ATTACHMENT_MIME_TYPES[ext] ?? (typed === "" ? mimeForAttachmentExtension(ext) : file.mimeType);
+        const now = Date.now();
+        const ticket: AttachmentTicket = {
+          id: generateTicketId(),
+          kind: "upload",
+          vaultName: ticketSeam.vaultName,
+          createdAt: now,
+          expiresAt: now + computeTicketTtlMs(file.bytes.length),
+          noteId: note.id,
+          filename: file.name ?? `${String((params.file as { id?: unknown }).id ?? "file")}${ext}`,
+          mimeType,
+          sizeBytes: file.bytes.length,
+          transcribe: params.transcribe === true,
+          ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
+          ...(ticketSeam.grant ? { grant: ticketSeam.grant } : {}),
+        };
+        const attachment = await storeUpload(ticket, file.bytes);
+        return {
+          attachment: { id: attachment.id, path: attachment.path, mime_type: attachment.mimeType, size: file.bytes.length },
+          record: note.id,
+        };
+      },
+    });
+  }
+
   // =====================================================================
   // 14. read-attachment — model-lane byte reads (Wave 2). Present ONLY
   // when the server layer wires an AttachmentBytesProvider — see
@@ -3294,6 +3361,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   for (const entry of MCP_TOOL_MANIFEST) {
     if (entry.condition === "attachment-tickets" && !ticketSeam) continue;
     if (entry.condition === "attachment-bytes" && !bytesSeam) continue;
+    if (entry.condition === "attachment-store" && !storeUpload) continue;
     const impl = executorsByName.get(entry.name);
     if (!impl) {
       // A core (or wired-seam) tool with no executor is a manifest/impl drift

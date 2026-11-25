@@ -355,6 +355,33 @@
       "status": "drift",
       "owner": "T-476 sharing (cloud twin needs key sign-in at identity, SPEC-1.0-grants §8)",
       "why": "A box lets the owner's key invite someone to one vault by name (account door `invite-to-vault`, `take-back-invite`; `list-access` names people), and the friend read the invite (`POST /account/invites/look`) and accept it with their own key (`POST /account/invites/accept`, NIP-98), becoming a member of that vault. Cloud and the personal door have no key sign-in for a second person yet, so they have neither (app docs/design/SHARING.md)."
+    },
+    {
+      "id": "add-attachment",
+      "keys": [
+        "has/add-attachment",
+        "files/add-attachment.*",
+        "mcp/*.tool.add-attachment.*",
+        "mcp/*.tool-count",
+        "annotations/destructive.tools",
+        "records/mcp.order"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "releases": [
+        "0.9",
+        "0.9.1"
+      ],
+      "lacks": [
+        "cloud",
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "T-476 add-attachment: a cloud-style door lists it once its engine pin carries it and it wires the ticket seam's storeUpload (parachute-cloud)",
+      "why": "A box takes a small file in the MCP call itself (`add-attachment {record, file}`, the file-transfer extension's FileInput with base64 `data` and a SHA-256 `digest`, up to the measured inline cap), so an AI whose runtime can't reach the ticket URL (Claude's code sandbox) can still store it. A cloud-style door on an engine before T-476 has only `attachment-url`, whose bytes go to a URL that sandbox can't reach."
     }
   ]
 }

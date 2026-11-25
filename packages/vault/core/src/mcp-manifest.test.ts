@@ -42,6 +42,7 @@ const ticketOpts = {
   },
 };
 const bytesOpts = { attachmentBytes: { provider: {} as any } };
+const storeOpts = { attachmentTickets: { ...ticketOpts.attachmentTickets, storeUpload: async () => ({}) as any } };
 
 /**
  * The observable contract, as emitted by `main` the day this manifest was
@@ -71,6 +72,7 @@ const EXPECTED: ReadonlyArray<{
   { name: "doctor", requiredVerb: "read", condition: "core", hasResultContent: false },
   { name: "request-attachment-upload", requiredVerb: "write", condition: "attachment-tickets", hasResultContent: false },
   { name: "request-attachment-download", requiredVerb: "read", condition: "attachment-tickets", hasResultContent: false },
+  { name: "add-attachment", requiredVerb: "write", condition: "attachment-store", hasResultContent: false },
   { name: "read-attachment", requiredVerb: "read", condition: "attachment-bytes", hasResultContent: true },
 ];
 
@@ -118,16 +120,24 @@ describe("generateMcpTools — conditional inclusion (byte-for-byte with main)",
     expect(tools.length).toBe(15);
   });
 
-  test("both seams → all 17 tools in emission order", () => {
-    const tools = generateMcpTools(fakeStore, { ...ticketOpts, ...bytesOpts });
+  test("the ticket seam's storeUpload adds add-attachment (T-476)", () => {
+    const tools = generateMcpTools(fakeStore, storeOpts);
+    expect(names(tools)).toEqual(
+      EXPECTED.filter((e) => e.condition !== "attachment-bytes").map((e) => e.name),
+    );
+    expect(tools.find((t) => t.name === "add-attachment")?.requiredVerb).toBe("write");
+  });
+
+  test("every seam → all 18 tools in emission order", () => {
+    const tools = generateMcpTools(fakeStore, { ...storeOpts, ...bytesOpts });
     expect(names(tools)).toEqual(EXPECTED.map((e) => e.name));
-    expect(tools.length).toBe(17);
+    expect(tools.length).toBe(18);
   });
 });
 
 describe("generateMcpTools — the emitted set IS the manifest (drift pin)", () => {
-  const tools = generateMcpTools(fakeStore, { ...ticketOpts, ...bytesOpts });
-  const includedEntries = MCP_TOOL_MANIFEST; // all conditions satisfied by both seams
+  const tools = generateMcpTools(fakeStore, { ...storeOpts, ...bytesOpts });
+  const includedEntries = MCP_TOOL_MANIFEST; // all conditions satisfied by every seam
 
   test("emitted {name,description,inputSchema,requiredVerb} deep-equals the manifest, in order", () => {
     expect(

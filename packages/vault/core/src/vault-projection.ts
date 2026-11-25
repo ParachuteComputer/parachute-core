@@ -25,6 +25,7 @@ import {
   type SchemaField,
 } from "./schema-defaults.ts";
 import { listIndexedFields } from "./indexed-fields.ts";
+import { MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.ts";
 import {
   listTagRecords,
   type TagFieldSchema,
@@ -292,13 +293,16 @@ function sqliteToUserType(t: string): string {
 /**
  * The Attachments orientation block, rendered into the connect-time
  * markdown brief (`projectionToMarkdown`) so every agent learns, every
- * session, how to move file bytes into/out of this vault without spending
- * its own context on them (bytes never ride MCP either way).
+ * session, how to move file bytes into/out of this vault: by URL (the bytes
+ * skip the conversation), in the call (`add-attachment`, a small file, T-476),
+ * or read into the conversation (`read-attachment`).
  *
  * `ticketsEnabled` reflects whether THIS door has wired an
  * `AttachmentTicketProvider` (bun: always, as of the Wave 1 PR; cloud: always,
  * since cloud#177). `readEnabled` reflects whether it's
  * wired an `AttachmentBytesProvider` (bun: always, as of this PR — Wave 2).
+ * `addEnabled` reflects whether it wired the ticket seam's `storeUpload`
+ * (`add-attachment`).
  * An unwired seam omits BOTH its tool(s) from `tools/list` (see
  * `generateMcpTools`'s `attachmentTickets` / `attachmentBytes` opts) AND
  * its sentence here — the brief never dangles a pointer at a tool the
@@ -308,7 +312,7 @@ function sqliteToUserType(t: string): string {
  * inside the connect-time brief's token budget — see
  * `projectionToMarkdown`'s doc comment.
  */
-export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string }): string {
+export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string; addEnabled?: boolean }): string {
   const sentences: string[] = [
     "`include_attachments: true` on `query-notes` lists a note's attachments.",
   ];
@@ -317,6 +321,12 @@ export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; rea
       opts.ticketTool
         ? `\`${opts.ticketTool}\` gives a one-use URL to PUT or GET the bytes.`
         : "`request-attachment-upload` / `request-attachment-download` give a one-use URL to PUT or GET the bytes.",
+    );
+  }
+  if (opts.addEnabled) {
+    // T-476: the one way that needs no network beyond the MCP call itself, so an AI in a sandbox uses it.
+    sentences.push(
+      `\`add-attachment\` stores a file sent in the call (base64 \`file.data\`, up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB): use it whenever you hold the bytes, and the URL only for a bigger file when your runtime can reach this host.`,
     );
   }
   if (opts.readEnabled) {
@@ -384,7 +394,7 @@ export function projectionToMarkdown(args: {
    * that hasn't wired ticket support yet (or a test fixture) never
    * accidentally advertises tools it can't back.
    */
-  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string };
+  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string; addEnabled?: boolean };
   /**
    * The server's own words for this door (T-407: record words where the
    * record tools are listed). Applied to the fixed text only, never to the
