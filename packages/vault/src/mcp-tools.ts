@@ -336,7 +336,8 @@ export function generateScopedMcpTools(
     // G2: a scoped session changes `metadata.published` only with the published tag in scope.
     ...(scoped ? { mayChangePublished: () => tagVisibleInScope(readVaultConfig(vaultName)?.published_tag ?? "publish", allowedHolder.value, rawTags) } : {}),
     // T-476: only an admin key (or the owner's own local session, no auth) adds or changes a skill (core skills.ts).
-    maySkills: !auth || hasScopeForVault(auth.scopes, vaultName, "admin"),
+    // A tag-scoped admin is not vault-wide (it can't set the description either), and a skill reaches every AI.
+    maySkills: !auth || (hasScopeForVault(auth.scopes, vaultName, "admin") && !scoped),
     ...(ambiguityVisible ? { ambiguityVisible } : {}),
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),

@@ -329,6 +329,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       // write with the fresh precondition.
       const fresh = await store.getNote(noteId);
       if (!fresh) return;
+      if (hasSkillType(fresh.tags)) return; // it may have become a skill since the first read
       const reUpdate = transform(fresh);
       if (reUpdate === null) return;
 
@@ -348,6 +349,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       // the latest content. Otherwise skip — don't clobber the user.
       const latest = await store.getNote(noteId);
       if (!latest) return;
+      if (hasSkillType(latest.tags)) return; // as above: never into a skill's body
       if (!safeWithoutPrecondition(latest)) {
         logger.error(
           `[transcribe] ${op}: note ${noteId} kept changing under us (double conflict); skipping to avoid clobbering a concurrent edit`,

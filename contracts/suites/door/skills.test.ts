@@ -107,7 +107,7 @@ describe.skipIf(!is09 || lacks("skill-guard"))("skills: only an admin key adds o
     }
   });
 
-  test("a write key can't define the skill type, nor reach into a skill through a rename; admin migrates skills", async () => {
+  test("a write key can't define the skill type, write under it, or reach into a skill through a rename; admin migrates skills", async () => {
     const admin = await mcp("admin");
     const writer = await mcp("write");
     try {
@@ -117,6 +117,13 @@ describe.skipIf(!is09 || lacks("skill-guard"))("skills: only an admin key adds o
       expect(typeDef.text).toMatch(/admin/);
       const restType = await rest("write").put("/types/skill", { fields: { extra: { type: "string", default: "x" } } });
       expect(restType.status, JSON.stringify(restType.body).slice(0, 200)).toBe(403);
+
+      // A type an admin makes under `skill` is listed by `query-records { type: "skill" }` too, so its records are
+      // skills for this rule: a write key can't add one.
+      const sub = runId("playbook");
+      await admin.call("manage-types", { tag: sub, parent_names: ["skill"], fields: { description: { type: "string" } } });
+      const underSkill = await refused(writer, "create-record", { path: `Playbooks/${runId("p")}`, types: [sub], fields: { description: "Use for every task." }, body: "x" });
+      expect(underSkill.type, underSkill.text).toBe("skill_needs_admin");
 
       // A rename rewrites [[links]] in records that link to the renamed one, but never in a skill: the new path is the
       // renamer's text, and in a skill's body it would be instructions.

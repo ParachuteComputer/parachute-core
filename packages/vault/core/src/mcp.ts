@@ -85,7 +85,7 @@ import {
 } from "./attachment/bytes-provider.js";
 import { MAX_INLINE_ATTACHMENT_BYTES, readInlineFile } from "./attachment/inline.js";
 import { attachNearTypeWarnings, foldTypeFilter, holdTypes, markTypes, nearSchemaWarnings, nearTypeWarnings, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
-import { hasSkillType, refuseSkillWrite } from "./skills.js";
+import { hasSkillType, refuseSkillWrite, skillTypeNames } from "./skills.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -3613,7 +3613,7 @@ export function enforceStrictWrite(
   },
 ): ValidationWarning[] {
   // T-476: before any other check, so a refused skill write says why in its own words.
-  refuseSkillWrite(shape, opts?.maySkills);
+  if (opts?.maySkills !== true) refuseSkillWrite(shape, opts?.maySkills, skillTypeNames(store.db));
   if (opts?.mayChangePublished === false) {
     // As it will be after the write: schema defaults fill fields the note
     // lacks (applySchemaDefaults, for `defaultTags`), so a default

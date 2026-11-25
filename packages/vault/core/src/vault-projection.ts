@@ -374,15 +374,15 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
   return `This connection can read only the records tagged ${list} (subtags included); other records are hidden from it.${can.scoped}`;
 }
 
-/**
- * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
- * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
- */
 /** The one line that points an AI at the vault's own skills (records of type `skill`, written by an admin or a pack). */
 export const SKILLS_LINE =
   "This vault keeps skills: instructions its owner wrote for you. `query-records { type: \"skill\" }` lists them, each " +
   "with a `description`; before a task a description matches, read that skill in full and follow it.";
 
+/**
+ * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
+ * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
+ */
 export const LIVE_PAGE_BLOCK =
   "A Claude artifact over this vault reads with `watchTool` on `query-records` and writes on a click with " +
   "`update-record` (`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again. It declares " +
