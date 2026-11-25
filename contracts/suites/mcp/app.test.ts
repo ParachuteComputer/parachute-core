@@ -94,6 +94,10 @@ describe("mcp/app: the person's approved applets as an MCP App", () => {
       });
       return (await r.json()) as any;
     };
+    // the door says it serves MCP Apps (claude.ai's first tile click re-read server/discover and failed without it)
+    const discover = await modern("server/discover");
+    expect(discover.result.capabilities.extensions?.["io.modelcontextprotocol/ui"]).toEqual({ mimeTypes: ["text/html;profile=mcp-app"] });
+    expect(discover.result.capabilities.extensions?.["io.modelcontextprotocol/skills"]).toBeDefined();
     const list = await modern("tools/list");
     expect(list.result.resultType).toBe("complete"); // the 2026-07-28 door answered, not the 2025 one
     const tools = list.result.tools as any[];

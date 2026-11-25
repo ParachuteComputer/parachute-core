@@ -29,6 +29,9 @@ import { looksLikeJwt } from "./hub-jwt.ts";
 import { READ } from "../core/src/mcp-annotations.ts";
 
 export const MCP_APP_MIME = "text/html;profile=mcp-app";
+/** The MCP Apps extension's id (ext-apps `EXTENSION_ID`): a client declares it, and the 2026-07-28 door with a view
+ *  declares it too (mcp-modern.ts; the 2025 door is as before, suites/door/skills.test.ts). */
+export const UI_EXTENSION_ID = "io.modelcontextprotocol/ui";
 export const APPLET_URI_PREFIX = "ui://parachute/applet/";
 export const OPEN_PREFIX = "open-";
 /** The payload version the view reads (applet-host src/payload.ts). */

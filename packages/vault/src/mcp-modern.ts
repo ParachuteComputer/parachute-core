@@ -17,7 +17,7 @@ import { createMcpHandler, isLegacyRequest, McpServer, ProtocolError, ResourceTe
 import { SkillsExtension, type SkillSource } from "@modelcontextprotocol/server/ext/skills";
 import pkg from "../package.json" with { type: "json" };
 import type { AppletViews, toolSurface } from "./mcp-http.ts";
-import { APPLET_URI_PREFIX, MCP_APP_MIME } from "./mcp-app.ts";
+import { APPLET_URI_PREFIX, MCP_APP_MIME, UI_EXTENSION_ID } from "./mcp-app.ts";
 
 export { isLegacyRequest };
 
@@ -66,6 +66,9 @@ function modernHandler(): ReturnType<typeof createMcpHandler> {
       // connects on 2026-07-28 and declares MCP Apps there (io.modelcontextprotocol/ui, T-476 claudereal 11-25).
       const views = door.views;
       if (views) {
+        // Say the door serves MCP Apps (SEP-1724 extensions, the id the client declares). claude.ai's first tile click
+        // only re-read server/discover and failed while it was missing (claudereal, 11-25).
+        mcp.server.registerCapabilities({ extensions: { [UI_EXTENSION_ID]: { mimeTypes: [MCP_APP_MIME] } } });
         mcp.registerResource(
           "parachute-applets",
           new ResourceTemplate(`${APPLET_URI_PREFIX}{id}`, { list: async () => ({ resources: await views.list() }) }),
