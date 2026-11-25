@@ -106,7 +106,7 @@ describe("one way to refuse", () => {
 
   // The box's 2026-07-28 door is its own code (mcp-modern.ts, SDK v2) beside the 2025 one, and it is the door Claude
   // Code reaches for skills. It refuses as the 2025 door does, word for word. It comes with the Skills extension, so a
-  // door without that (cloud's own 2026-07-28 handler, deliberate.json skills-extension) isn't asked here; the 2025
+  // door without that isn't asked here (Cloud's own 2026-07-28 handler serves it since parachute-cloud #449); the 2025
   // test above holds every door. No fingerprints: the 2025 door's are the record, and this one must equal them.
   test.skipIf(lacks("skills-extension"))("the vault door on a 2026-07-28 connection: the same refusals, the same words", async () => {
     const url = `${door().vaultOrigin}/vault/${door().vault}/mcp`;
