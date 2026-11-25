@@ -363,6 +363,18 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
   return `This connection can read only the records tagged ${list} (subtags included); other records are hidden from it.${can.scoped}`;
 }
 
+/**
+ * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
+ * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
+ */
+export const LIVE_PAGE_BLOCK =
+  "A live page reads this vault each time someone opens it. Declare only the tools it calls: `query-records` to read, " +
+  "`update-record` to change, `create-record` to add. Read with `watchTool` on `query-records`, filtered by `type`, " +
+  "`path_prefix` or `fields`; the reply is JSON: one record, an array, or `{records, next_cursor}`. A record's name is " +
+  "the last part of its `path`. Write only on the person's click: `update-record {id, fields or body, if_updated_at: " +
+  "record.updatedAt}`, then `invalidate` the reads. A conflict means it changed elsewhere: read it again, never " +
+  "`force`. Use this vault's own type and field names. Guide: https://parachute.computer/docs/use/claude-artifacts/";
+
 export function projectionToMarkdown(args: {
   vaultName: string;
   description?: string | null;
@@ -545,6 +557,13 @@ export function projectionToMarkdown(args: {
   lines.push("## Attachments");
   lines.push("");
   lines.push(w(attachmentsInstructionBlock(args.attachments ?? { ticketsEnabled: false })));
+
+  // T-476: a live page (a Claude artifact) calls this connector on every view, without the model. These are the
+  // words a page needs to be right the first time: the reply's shape and the concurrency token as a record carries it.
+  lines.push("");
+  lines.push("## Live pages (Claude artifacts)");
+  lines.push("");
+  lines.push(LIVE_PAGE_BLOCK);
 
   // Scripting pointer block: the connect-time brief used to dead-end on
   // querying — an agent had no path to "how do I script/automate against this

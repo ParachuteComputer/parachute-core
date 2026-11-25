@@ -59,6 +59,35 @@ describe.skipIf(!is09)("the record door over MCP", () => {
       await c.close();
     }
   });
+
+  // T-476: a live page (a Claude artifact) is written from these words alone, with no model in the loop to recover
+  // from a wrong key. So the concurrency token the update-record words and the connect-time brief name must be a key a
+  // record read carries, and a write armed with it must land, and a stale one be refused.
+  test("the token the words name is a key a record carries: the write armed with it lands, a stale one is refused", async () => {
+    const c = await mcp("write");
+    try {
+      const words = (await c.tools()).find((t) => t.name === "update-record")?.description ?? "";
+      const named = /`if_updated_at` \(the record's `(\w+)`/.exec(words)?.[1];
+      expect(named, words).toBeTruthy();
+      const brief = c.client.getInstructions() ?? "";
+      expect(/if_updated_at: record\.(\w+)/.exec(brief)?.[1], "the brief's live-page words name the same key").toBe(named!);
+      const path = `records/${runId("page")}`;
+      await c.call("create-record", { path, fields: { status: "open" }, body: "Water the beds." });
+      const r = one(await c.call("query-records", { id: path }));
+      expect(typeof r[named!], `a read record carries ${named}`).toBe("string");
+      const done = await c.call("update-record", { id: r.id, fields: { status: "done" }, if_updated_at: r[named!] });
+      expect(done.fields.status).toBe("done");
+      const stale: any = await c.call("update-record", { id: r.id, fields: { status: "open" }, if_updated_at: r[named!] }).then(
+        () => null,
+        (e) => e,
+      );
+      expect(stale, "a write with the token read before another write is refused").not.toBeNull();
+      expect(String(stale?.data?.error_type ?? stale?.message)).toMatch(/conflict/);
+      expect(one(await c.call("query-records", { id: path })).fields.status).toBe("done");
+    } finally {
+      await c.close();
+    }
+  });
 });
 
 describe.skipIf(!is09 || lacks("records-over-rest"))("the record door over REST", () => {
