@@ -169,6 +169,9 @@ describe("add-attachment", () => {
     expect(blank.attachment.path).not.toMatch(/\.svg$/);
     const rows = await store.getAttachments(note.id);
     expect(rows.map((a) => a.path).filter((p) => /\.(html|svg|js)$/.test(p))).toEqual([]);
+    // No name, a text type: stored with that type's extension, so a download serves it as text.
+    const { name: _n2, ...unnamedText } = fileInput(bytes, { mimeType: "text/plain" });
+    expect((await add(vault, { record: note.id, file: unnamedText })).attachment.path).toEndWith(".txt");
   });
 
   test("a digest in plain base64 (+ and /) is taken as well as base64url", async () => {
