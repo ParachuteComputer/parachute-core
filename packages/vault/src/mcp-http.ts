@@ -174,7 +174,7 @@ export async function handleMcp(
   );
 
   const tools = toolSurface(getTools, vaultName, auth);
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.list() }));
+  server.setRequestHandler(ListToolsRequestSchema, async (request) => ({ tools: tools.list(request.params?._meta) }));
   server.setRequestHandler(CallToolRequestSchema, (request) => tools.call(request));
 
   await server.connect(transport);
@@ -190,7 +190,7 @@ export function toolSurface(
   vaultName: string,
   auth: AuthResult,
 ): {
-  list: () => Array<{ name: string; description: string; inputSchema: Record<string, unknown>; annotations: ReturnType<typeof toolAnnotations> }>;
+  list: (meta?: unknown) => Array<{ name: string; description: string; inputSchema: Record<string, unknown>; annotations: ReturnType<typeof toolAnnotations> }>;
   call: (request: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<any>;
   /** The tools this key can see, by name (mcp-skills.ts reads skill records through query-records). */
   byName: (name: string) => McpToolDef | undefined;
@@ -212,32 +212,14 @@ export function toolSurface(
   // can't set the vault-wide description, so for the hints it counts as a writer.
   const tagScoped = (auth.scoped_tags?.length ?? 0) > 0;
   const level = hasScopeForVault(auth.scopes, vaultName, "admin") && !tagScoped ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
-  server.setRequestHandler(ListToolsRequestSchema, async (request) => ({
-    tools: visibleTools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      // T-476: a file argument is marked `x-mcp-file` only for a client that declared the file-transfer extension.
-      inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(request.params?._meta)),
-      annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
-    })),
-  }));
-
-  // T-407: a record tool's domain errors are built below from its note tool's error, so they'd teach the note tool
-  // (`re-read the note (query-notes)`, `note_id`); the record door says them in its own words.
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    try {
-      return await callTool(request);
-    } catch (err) {
-      if (err instanceof McpError && NOTE_TOOL_NAMES[request.params.name]) throw recordDoorError(err);
-      throw err;
-    }
-  });
   return {
-    list: () =>
+    // `meta`: the request's `_meta` (T-476: a file argument is marked `x-mcp-file` only for a client that declared the
+    // file-transfer extension).
+    list: (meta?: unknown) =>
       visibleTools.map((t) => ({
         name: t.name,
         description: t.description,
-        inputSchema: t.inputSchema,
+        inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(meta)),
         annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
       })),
     // T-407: a record tool's domain errors are built below from its note tool's error, so they'd teach the note tool

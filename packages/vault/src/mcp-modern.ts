@@ -48,7 +48,9 @@ function modernHandler(): ReturnType<typeof createMcpHandler> {
         { instructions: door.instruction, capabilities: { tools: {} } },
       );
       // Core's JSON Schemas are typed loosely (Record<string, unknown>); they are the same objects the 2025 path sends.
-      mcp.server.setRequestHandler("tools/list", async () => ({ tools: door.tools.list() as never }));
+      mcp.server.setRequestHandler("tools/list", async (request) => ({
+        tools: door.tools.list((request.params as { _meta?: unknown } | undefined)?._meta) as never,
+      }));
       mcp.server.setRequestHandler("tools/call", async (request) => {
         try {
           const result = await door.tools.call({
