@@ -67,7 +67,7 @@
 {"key":"exit/http.headers","value":{"disposition":"attachment; filename=\"vault-<v>-<time>.tar\"","type":"application/x-tar"}}
 {"key":"files/add-attachment.annotations","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"files/add-attachment.refusal.digest","value":{"code":-32602,"field":"file.digest","type":"digest_mismatch"}}
-{"key":"files/add-attachment.refusal.no-record","value":{"code":-32602,"field":"id","type":"not_found"}}
+{"key":"files/add-attachment.refusal.no-record","value":{"code":-32602,"field":"record","type":"not_found"}}
 {"key":"files/add-attachment.refusal.size","value":{"code":-32602,"field":"file.size","type":"size_mismatch"}}
 {"key":"files/add-attachment.refusal.too-large","value":{"code":-32602,"field":"file.size","type":"inline_too_large"}}
 {"key":"files/add-attachment.result.shape","value":{"attachment":{"id":"string","mime_type":"string","path":"string","size":"number"},"record":"string"}}
@@ -135,7 +135,7 @@
 {"key":"mcp/admin.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.add-attachment.present","value":true}
 {"key":"mcp/admin.tool.add-attachment.schema","value":"87c472435e828ac5"}
-{"key":"mcp/admin.tool.add-attachment.words","value":"6f0ec94322addd54"}
+{"key":"mcp/admin.tool.add-attachment.words","value":"6ff3e5d46ced172a"}
 {"key":"mcp/admin.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.attachment-url.present","value":true}
 {"key":"mcp/admin.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
@@ -331,7 +331,7 @@
 {"key":"mcp/write.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.add-attachment.present","value":true}
 {"key":"mcp/write.tool.add-attachment.schema","value":"87c472435e828ac5"}
-{"key":"mcp/write.tool.add-attachment.words","value":"6f0ec94322addd54"}
+{"key":"mcp/write.tool.add-attachment.words","value":"6ff3e5d46ced172a"}
 {"key":"mcp/write.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.attachment-url.present","value":true}
 {"key":"mcp/write.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
