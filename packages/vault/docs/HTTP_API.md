@@ -714,6 +714,7 @@ whose JSON was `{error, error_type}` (a missing note or tag, a tag-scope refusal
 | `missing_required_field` | 400 | `field?`, `hint?` | A specific named field is required and absent (e.g. attachment `path`/`mimeType`, storage upload `file`). |
 | `payload_too_large` | 413 | `limit`, `got` | The JSON request body exceeds the 10MB cap on the mutating routes (`POST /notes`, `POST /notes/{id}/attachments`, `PATCH /notes/{idOrPath}`, `PUT /tags/{name}`, `PATCH /vault`). Parallel to `file_too_large` (the 100MB `/upload` cap); use the binary `/upload` path for large attachments. |
 | `tag_scope_violation` | 403 (REST) / forbidden (MCP) | `scoped_tags` | A tag-scoped token attempted a write outside its allowlist. |
+| `skill_needs_admin` | 403 (REST) / -32600 (MCP) | `message`, `hint` | A key without admin tried to make, change or unmake a skill (a record of type `skill`, any case). A skill is instructions every connected AI may follow, so only an admin key, or a pack installed with `add-pack`, adds or changes one (T-476). Reading skills needs no admin; deleting one stays at write, as for any record. |
 | `internal_error` | 500 | — | An invariant the server expected to hold didn't (e.g. a just-created note not found on immediate re-read). Rare; file an issue if seen. |
 
 ### Vault config (`PATCH /api/vault`)

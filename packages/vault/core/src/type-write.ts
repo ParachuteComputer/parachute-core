@@ -10,6 +10,7 @@
 import type { Database } from "bun:sqlite";
 import { getTagRecord } from "./tag-schemas.js";
 import { DEFAULT_TAG_NAME } from "./tag-hierarchy.js";
+import { hasSkillType } from "./skills.js";
 
 /** The caller's write stamp: the same two facts its record writes carry. */
 export interface TypeWriter {
@@ -95,6 +96,8 @@ export function writeTypeProblem(db: Database, name: string, change: TypeChange,
   // Names whose fields reach other types' records: `_default` (every record's implicit parent), any `_` name the
   // vault keeps, and a name some type lists as its parent (its fields flow to that type's records).
   if (name === DEFAULT_TAG_NAME || name.startsWith("_")) return needs(`Changing "${name}", which every record inherits from,`);
+  // T-476: the skill type's fields and defaults land on every skill (instructions every connected AI may follow).
+  if (hasSkillType([name])) return needs(`Defining "${name}", the skill type,`);
   if (namedAsParent(db, name)) return needs(`Changing "${name}", another type's parent,`);
   if (typeIsUndefined(db, name)) return null;
   const creator = typeCreator(db, name);

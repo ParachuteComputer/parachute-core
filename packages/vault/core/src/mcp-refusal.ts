@@ -107,6 +107,8 @@ export function refusalOfError(err: unknown): McpRefusal | null {
     });
   }
   if (e.code === "PUBLISH_OUT_OF_SCOPE") return refusal("tag_scope_violation", message);
+  // a skill is instructions every connected AI may follow; only an admin key adds or changes one (T-476)
+  if (e.code === "SKILL_NEEDS_ADMIN") return refusal("skill_needs_admin", message, { hint: e.hint });
   if (e.code === "SCHEMA_VALIDATION") return refusal("schema_validation", message, { violations: e.violations ?? [], hint: "fix every field listed in violations and retry — none of this write was applied" });
   if (e.code === "PRECONDITION_REQUIRED") {
     return refusal("precondition_required", message, { note_id: e.note_id, path: e.note_path ?? null, hint: "re-read the note and pass its updatedAt as if_updated_at, or pass force: true to skip the check" });
