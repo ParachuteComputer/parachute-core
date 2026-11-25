@@ -25,12 +25,12 @@ export const FILES_EXTENSION = "io.modelcontextprotocol/files";
  *
  * Measured, not guessed (T-476, 2026-11-24): a Claude model fills `file.data`
  * by typing the base64 itself, and random base64 costs about one output token
- * per character. Claude Opus retyped 16 KiB (22,136 base64 characters) and
- * 24 KiB (33,200) into one tool argument byte for byte; at 32 KiB
- * (44,267 characters) the call no longer fits one reply. So the cap is 24 KiB.
- * An agent with network access sends a larger file through `attachment-url`.
+ * per character. Claude Opus 5.5 retyped 16, 24, 32, 40, 56 and 80 KiB of random bytes into one
+ * tool argument byte for byte (SHA-256 checked); the cap is the largest that
+ * came back exact. An agent with network access sends a larger file through
+ * the ticket URL (`attachment-url`; `request-attachment-upload` on 0.8).
  */
-export const MAX_INLINE_ATTACHMENT_BYTES = 24 * 1024;
+export const MAX_INLINE_ATTACHMENT_BYTES = 80 * 1024;
 
 /**
  * The `file` argument's schema: the extension's FileInput, marked `x-mcp-file`. A door shows the marker only to a

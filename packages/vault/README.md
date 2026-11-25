@@ -265,7 +265,7 @@ home's `run/deprecations.json` (`parachute changes` prints the counts).
 **Graph**: `find-path` (BFS between two notes)
 **Vault**: `vault-info` (get/update description + stats)
 **Admin**: `prune-schema`, `doctor` (taxonomy/metadata integrity scan), `manage-token`
-**Attachments** (present when the door wires an attachment-ticket provider — always true on this server): `attachment-url` (`action: "upload" | "download"`; the 0.8 names `request-attachment-upload`, `request-attachment-download` stay as deprecated aliases) — mint a short-lived, single-use ticket a runtime's shell spends directly at `/vault/{name}/tickets/{id}`; bytes never pass through the tool call. `add-attachment` stores a small file (up to 24 KiB) whose bytes come in the call itself, for an AI whose runtime can't reach the ticket URL, such as Claude's code sandbox. See [`docs/HTTP_API.md`](./docs/HTTP_API.md#attachment-tickets-vault611-both-doors).
+**Attachments** (present when the door wires an attachment-ticket provider — always true on this server): `attachment-url` (`action: "upload" | "download"`; the 0.8 names `request-attachment-upload`, `request-attachment-download` stay as deprecated aliases) — mint a short-lived, single-use ticket a runtime's shell spends directly at `/vault/{name}/tickets/{id}`; bytes never pass through the tool call. `add-attachment` stores a small file (up to 80 KiB) whose bytes come in the call itself, for an AI whose runtime can't reach the ticket URL, such as Claude's code sandbox. See [`docs/HTTP_API.md`](./docs/HTTP_API.md#attachment-tickets-vault611-both-doors).
 
 ### Vault descriptions
 

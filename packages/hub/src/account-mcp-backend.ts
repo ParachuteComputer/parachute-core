@@ -309,8 +309,9 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
         // that hold admin, as before: its writer list fits a 4,000-token budget (contracts door/multivault), and an AI
         // makes a type at the vault's own address.
         .filter((t) => t.name !== "manage-types" || verbForVault(ctx, vault.name) === "admin")
-        // T-476: add-attachment (a file sent in the call) stays at the vault's own address, for the same budget; an AI
-        // stores a file through the vault it was connected to, and Cloud's account door has no attachment tools.
+        // T-476: add-attachment (a file sent in the call) isn't listed here, for the same budget: an AI stores a file
+        // through the vault it was connected to, and Cloud's account door has no attachment tools. A call naming it
+        // still reaches the vault, which checks the write verb.
         .filter((t) => t.name !== "add-attachment")
         .map((t) => injectVaultSelector(COMPOSED_VERB_RANK[verbForVault(ctx, vault.name)] < topRank ? { ...t, annotations: undefined } : t));
     } catch {
