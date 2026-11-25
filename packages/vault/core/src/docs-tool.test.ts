@@ -14,7 +14,7 @@ function site(pages = SITE) {
   const f = (async (url: string | URL, init?: RequestInit) => {
     const u = new URL(String(url));
     asked.push(u.pathname);
-    expect(init?.redirect).toBe("follow");
+    expect(init?.redirect).toBe("manual");
     const body = pages[u.pathname];
     return body === undefined ? new Response("not here", { status: 404 }) : new Response(body, { headers: { "content-type": "text/markdown" } });
   }) as typeof fetch;
@@ -181,15 +181,26 @@ describe("when the site is down", () => {
     await expect(tool.execute({ topic: "build/components" })).rejects.toMatchObject({ error_type: "unknown_topic" });
   });
 
-    test("a redirect is followed on the docs' own host (http to https), never off it", async () => {
-    const redirected = (to: string, body: string) =>
-      Object.defineProperties(new Response(body, { headers: { "content-type": "text/markdown" } }), { redirected: { value: true }, url: { value: to } });
-    const same = (async (url: string) => redirected(String(url).replace("http:", "https:"), "# Moved here")) as unknown as typeof fetch;
-    expect(((await buildDocsTool({ origin: "http://docs.example", fetch: same, cache: new Map() }).execute({ topic: "build/x" })) as { markdown: string }).markdown).toBe("# Moved here");
-    const off = (async () => redirected("https://elsewhere.example/docs/x.md", "# Not ours")) as unknown as typeof fetch;
+    test("a redirect is followed by hand on the docs' own host (http to https), never off it, never down to http", async () => {
+    const asked: string[] = [];
+    const host = (routes: Record<string, string>) =>
+      (async (url: string, init?: RequestInit) => {
+        expect(init?.redirect).toBe("manual");
+        asked.push(String(url));
+        const to = routes[String(url)];
+        return to ? new Response(null, { status: 301, headers: { location: to } }) : new Response("# Moved here", { headers: { "content-type": "text/markdown" } });
+      }) as unknown as typeof fetch;
+    const up = host({ "http://docs.example/docs/build/x.md": "https://docs.example/docs/build/x.md" });
+    expect(((await buildDocsTool({ origin: "http://docs.example", fetch: up, cache: new Map() }).execute({ topic: "build/x" })) as { markdown: string }).markdown).toBe("# Moved here");
+    asked.length = 0;
+    const off = host({ "https://docs.example/docs/build/x.md": "https://elsewhere.example/docs/x.md" });
     await expect(buildDocsTool({ origin: "https://docs.example", fetch: off, cache: new Map() }).execute({ topic: "build/x" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
+    expect(asked).toEqual(["https://docs.example/docs/build/x.md"]); // nothing requested off the docs host
+    const down = host({ "https://docs.example/docs/build/x.md": "http://docs.example/docs/build/x.md" });
+    await expect(buildDocsTool({ origin: "https://docs.example", fetch: down, cache: new Map() }).execute({ topic: "build/x" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
     // a fix page has its built-in copy instead
-    expect(((await buildDocsTool({ origin: "https://docs.example", fetch: off, cache: new Map() }).execute({ topic: "fix/conflict" })) as { note: string }).note).toContain("redirected off the docs host");
+    const allOff = host({ "https://docs.example/docs/fix/conflict.md": "https://elsewhere.example/x.md" });
+    expect(((await buildDocsTool({ origin: "https://docs.example", fetch: allOff, cache: new Map() }).execute({ topic: "fix/conflict" })) as { note: string }).note).toContain("it answered 301");
   });
 
   test("an explicit heading id with an underscore is a section too", async () => {

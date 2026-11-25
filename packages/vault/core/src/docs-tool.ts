@@ -88,14 +88,28 @@ export function docsMinor(version: string | undefined): string | null {
 }
 
 const trimOrigin = (o: string) => o.trim().replace(/\/+$/, "");
-/** Whether two addresses are on the same host (any scheme): where a docs read may be redirected. */
-const sameHost = (a: string, b: string): boolean => {
-  try {
-    return new URL(a).hostname === new URL(b).hostname;
-  } catch {
-    return false;
+/**
+ * A read that follows redirects by hand, and only on the docs' own host, never from https down to http: a redirect
+ * elsewhere (or a fourth hop) comes back as the 3xx itself, which the caller treats as the site being down. By hand, so
+ * nothing is ever requested off the docs host.
+ */
+async function getOnHost(get: typeof fetch, url: string, init: RequestInit): Promise<Response> {
+  let at = new URL(url);
+  for (let hop = 0; ; hop++) {
+    const res = await get(at.toString(), { ...init, redirect: "manual" });
+    const to = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+    if (!to || hop >= 3) return res;
+    let next: URL;
+    try {
+      next = new URL(to, at);
+    } catch {
+      return res;
+    }
+    if (next.hostname !== at.hostname || (at.protocol === "https:" && next.protocol !== "https:")) return res;
+    res.body?.cancel().catch(() => {});
+    at = next;
   }
-};
+}
 
 /** The address a person opens for a page (and the docs tool takes as a topic): this version's when the version is known. */
 export function docsPageUrl(ctx: { origin: string; version?: string }, topic: string): string {
@@ -229,8 +243,7 @@ export function latestRelease(origin: string, opts: { fetch?: typeof fetch; now?
   LATEST.set(key, entry); // before the read starts, so a read that fails at once still leaves this entry settled
   const refresh = (async () => {
     try {
-      const res = await get(`${key}/latest.json`, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "application/json" } });
-      if (res.redirected && !sameHost(res.url, key)) throw new Error("latest.json redirected off the docs host");
+      const res = await getOnHost(get, `${key}/latest.json`, { signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "application/json" } });
       if (!res.ok) {
         res.body?.cancel().catch(() => {});
         throw new Error(`latest.json answered ${res.status}`);
@@ -521,13 +534,9 @@ export function buildDocsTool(opts: DocsToolOpts = {}): DocsToolDef {
     }
     let text: string | null;
     try {
-      const res = await get(key, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "text/markdown, text/plain, application/json" } });
-      // A redirect is followed only on the docs' own host (http to https, a trailing slash): one that leaves it is the
-      // site down, never a page from somewhere else.
-      if (res.redirected && !sameHost(res.url, key)) {
-        res.body?.cancel().catch(() => {});
-        return hit?.text != null ? hit.text : { unreachable: "it redirected off the docs host" };
-      }
+      // A redirect is followed only on the docs' own host (http to https, a trailing slash); one that leaves it is the
+      // site down (below: not ok, not 404), never a page from somewhere else.
+      const res = await getOnHost(get, key, { signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "text/markdown, text/plain, application/json" } });
       if (!res.ok) {
         res.body?.cancel().catch(() => {}); // a 404 or an error page: nothing of it is read
         if (res.status !== 404) return hit?.text != null ? hit.text : { unreachable: `it answered ${res.status}` };

@@ -54,7 +54,7 @@
 {"key":"connect/token.lifetime","value":900}
 {"key":"connect/token.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
 {"key":"connect/written-by.stamp","value":{"by":"string","via":"key:<client>"}}
-{"key":"docs/brief-line","value":"Docs for Parachute <version> `docs {search}`, `docs {topic}`; a refusal's `docs` is its fix page."}
+{"key":"docs/brief-line","value":"Docs for Parachute <version>: `docs {search}`, `docs {topic}`; a refusal's `docs` is its fix page."}
 {"key":"exit/export-key.headers","value":{"type":"application/x-tar"}}
 {"key":"exit/export-key.mcp-refusal","value":{"status":403}}
 {"key":"exit/export-key.mint.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"null","name":"string","revoked_at":"null","scopes":["string"],"status":"string","token":"string","vault":"string"}}

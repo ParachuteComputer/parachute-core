@@ -20,7 +20,7 @@ describe.skipIf(!is09)("docs: where the fix is, for this version", () => {
       const line = brief.split("\n").find((l) => l.includes("`docs {search}`")) ?? "";
       expect(line).toMatch(/^Docs for Parachute \d+\.\d+\.\d+(-[0-9A-Za-z.]+)?( \(\S+ is out\))?(, from \S+)?: `docs \{search\}`, `docs \{topic\}`; a refusal's `docs` is its fix page\.$/);
       expect(brief.split("\n").indexOf(line)).toBeLessThanOrEqual(2);
-      fp("docs/brief-line", line.replace(/Parachute \S+( \(\S+ is out\))?/, "Parachute <version>"));
+      fp("docs/brief-line", line.replace(/Parachute [^\s:,]+( \(\S+ is out\))?/, "Parachute <version>"));
     } finally {
       await c.close();
     }
