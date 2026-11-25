@@ -4,7 +4,7 @@
 // vault's words), and never a reply that looks like data (`{error, error_type}` could be taken for a record).
 // Only the protocol's own errors (bad JSON, an unknown method) stay JSON-RPC errors.
 import { describe, expect, test } from "bun:test";
-import { accountToken, door, fp, mcp, runId, safeFetch, token } from "./_door.ts";
+import { accountToken, door, fp, lacks, mcp, runId, safeFetch, token } from "./_door.ts";
 
 /** A raw tools/call, so a JSON-RPC error can't hide behind the SDK's throw. */
 async function call(url: string, bearer: string, name: string, args: Record<string, unknown>): Promise<any> {
@@ -71,7 +71,9 @@ describe("one way to refuse", () => {
     }
   });
 
-  test("the account door: an unknown tool and a vault's refusal through it", async () => {
+  // The account door with the account credential: a cloud-style door's account door doesn't take it for tools yet
+  // (deliberate.json multi-vault-door, as annotations.test.ts); its own refusals are held by its own tests there.
+  test.skipIf(lacks("multi-vault-door"))("the account door: an unknown tool and a vault's refusal through it", async () => {
     const url = `${door().issuer}/account/mcp`;
     const bearer = await accountToken();
     oneShape("account.unknown-tool", await call(url, bearer, "no-such-tool", {}), "unknown_tool");
