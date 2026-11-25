@@ -170,6 +170,16 @@ export async function readInlineFile(
   if (!bytes) {
     refuse("`file.data` isn't base64", { error_type: "invalid_query", field: "file.data", hint: "RFC 4648 base64 (A-Z a-z 0-9 + /, = padding), e.g. the output of `base64 -w0 f`" });
   }
+  // The length bound above is coarse (base64 comes in 3-byte steps); the decoded length is the exact cap.
+  if (bytes.length > maxBytes) {
+    refuse(`The file (${bytes.length} bytes) is over the ${maxBytes} byte limit for a file sent in the call`, {
+      error_type: "inline_too_large",
+      field: "file.data",
+      limit: maxBytes,
+      got: bytes.length,
+      hint: `use ${uploadTool} and PUT the bytes to its URL, if your runtime can reach this host`,
+    });
+  }
   if (bytes.length !== size) {
     refuse(`file.data decodes to ${bytes.length} bytes, but file.size says ${size}`, {
       error_type: "size_mismatch",
