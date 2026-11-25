@@ -326,7 +326,7 @@ export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; rea
   if (opts.addEnabled) {
     // T-476: the one way that needs no network beyond the MCP call itself, so an AI in a sandbox uses it.
     sentences.push(
-      `\`add-attachment\` stores a file sent in the call (base64 \`file.data\`, up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB): use it whenever you hold the bytes, and the URL only for a bigger file when your runtime can reach this host.`,
+      `\`add-attachment\` stores a file of up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB sent in the call: use it when you hold the bytes.`,
     );
   }
   if (opts.readEnabled) {

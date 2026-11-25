@@ -233,7 +233,7 @@ describe("add-attachment", () => {
 
   test("the connect-time brief tells a writer to use it when it holds the bytes, and a reader nothing about it", async () => {
     const vault = freshVault("addatt-brief");
-    expect(await getServerInstruction(vault, auth(WRITE))).toContain("`add-attachment` stores a file sent in the call");
+    expect(await getServerInstruction(vault, auth(WRITE))).toContain("`add-attachment` stores a file of up to 80 KiB sent in the call");
     expect(await getServerInstruction(vault, auth(["vault:read"]))).not.toContain("add-attachment");
   });
 });
