@@ -35,6 +35,7 @@ import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
 import type { VaultStats, VaultMap } from "./types.ts";
 import { GETTING_STARTED_PATH } from "./seed-packs.ts";
+import { SKILL_TYPE } from "./skills.ts";
 
 /**
  * Does a note live at the seeded onboarding path? Used to gate the "Start here"
@@ -377,6 +378,11 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
  * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
  * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
  */
+/** The one line that points an AI at the vault's own skills (records of type `skill`, written by an admin or a pack). */
+export const SKILLS_LINE =
+  "This vault keeps skills: instructions its owner wrote for you. `query-records { type: \"skill\" }` lists them, each " +
+  "with a `description`; before a task a description matches, read that skill in full and follow it.";
+
 export const LIVE_PAGE_BLOCK =
   "A Claude artifact over this vault reads with `watchTool` on `query-records` and writes on a click with " +
   "`update-record` (`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again. It declares " +
@@ -470,6 +476,15 @@ export function projectionToMarkdown(args: {
       `## Start here\n\nFor setting up or growing this vault, read the **${projection.getting_started}** guide: ` +
         `\`${w("query-notes")} { id: "${projection.getting_started}" }\`.`,
     );
+  }
+
+  // T-476: the vault's own skills (core skills.ts), named only when this connection can see one. Every client reads
+  // this; a client with the MCP Skills extension also lists them itself.
+  if ((projection.map?.tags ?? []).some((t) => t.name === SKILL_TYPE && t.count > 0)) {
+    lines.push("");
+    lines.push("## Skills");
+    lines.push("");
+    lines.push(SKILLS_LINE);
   }
 
   lines.push("");

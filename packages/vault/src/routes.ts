@@ -150,6 +150,8 @@ export type WriteCtx = {
    * only what write may do through (type-write.ts `writeTypeProblem`), as MCP's manage-types does.
    */
   typeWriteOnly?: boolean;
+  /** T-476: the caller may add, change or unmake a skill (an admin key; core skills.ts). Omitted: it may not. */
+  maySkills?: boolean;
 };
 
 const vis = (t: TagScopeCtx) => { const v = buildExpandVisibility(t.allowed, t.raw); return v ? { isVisible: v } : undefined; };
@@ -166,10 +168,11 @@ const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
 function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
-  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; defaultTags?: string[] },
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; wasSkill?: boolean; defaultTags?: string[] },
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): void {
   enforceStrictWrite(store, shape, {
+    maySkills: writeCtx.maySkills === true,
     ...(tagScope.raw !== null ? { mayChangePublished: mayPublish(store, tagScope) } : {}),
     isVisible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
     bypass: writeCtx.bypassStrict === true,
@@ -192,6 +195,7 @@ function mayPublish(store: Store, tagScope: TagScopeCtx): boolean {
   return tagVisibleInScope(publishedTag, tagScope.allowed, tagScope.raw);
 }
 
+import { hasSkillType } from "../core/src/skills.ts";
 import {
   expandContent,
   DEFAULT_EXPAND_DEPTH,
@@ -272,6 +276,10 @@ function conflictResponse(e: any): Response | null {
   // the note exists / request is well-formed but violates the contract.
   if (e && e.code === "PUBLISH_OUT_OF_SCOPE") {
     return json({ error: "Forbidden", error_type: "tag_scope_violation", message: e.message }, 403);
+  }
+  // T-476: a skill is instructions every connected AI may follow; only an admin key adds or changes one.
+  if (e && e.code === "SKILL_NEEDS_ADMIN") {
+    return json({ error: "Forbidden", error_type: "skill_needs_admin", message: e.message, hint: e.hint }, 403);
   }
   if (e && e.code === "SCHEMA_VALIDATION") {
     return json(
@@ -2655,7 +2663,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true, wasSkill: hasSkillType(existingNote.tags) }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -2825,6 +2833,10 @@ async function handleNotesInner(
       try {
         await (batched ? transactionAsync(db, runBatch) : runBatch());
       } catch (e: any) {
+        // T-476: a write key making a skill (core skills.ts) — the same 403 as an update's (conflictResponse).
+        if (e && e.code === "SKILL_NEEDS_ADMIN") {
+          return json({ error: "Forbidden", error_type: "skill_needs_admin", message: e.message, hint: e.hint }, 403);
+        }
         // Duck-type for module-boundary robustness (matches the PATCH branch).
         if (e && e.code === "PATH_CONFLICT") {
           return json(
@@ -3230,6 +3242,7 @@ async function handleNotesInner(
           path: note ? note.path : latestTombstone(db, id)?.path,
           tags: note?.tags ?? [], metadata: version.metadata,
           wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true,
+          wasSkill: hasSkillType(note?.tags),
         }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
@@ -3664,7 +3677,7 @@ async function handleNotesInner(
         const projectedMeta = stBody !== undefined
           ? { ...baseMeta, [stBody.field as string]: stBody.to }
           : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true, wasSkill: hasSkillType(note.tags) }, tagScope);
       }
 
       // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,

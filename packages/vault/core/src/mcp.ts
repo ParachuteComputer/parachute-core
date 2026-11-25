@@ -85,6 +85,7 @@ import {
 } from "./attachment/bytes-provider.js";
 import { MAX_INLINE_ATTACHMENT_BYTES, readInlineFile } from "./attachment/inline.js";
 import { attachNearTypeWarnings, foldTypeFilter, holdTypes, markTypes, nearSchemaWarnings, nearTypeWarnings, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
+import { hasSkillType, refuseSkillWrite } from "./skills.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -600,6 +601,11 @@ export interface GenerateMcpToolsOpts {
    */
   mayChangePublished?: () => boolean;
   /**
+   * T-476: may this session add, change or unmake a skill (a record of type `skill`, skills.ts)? Only an admin key or a
+   * pack install may. Anything but `true` refuses (fail closed): a door that hasn't said is treated as a writer.
+   */
+  maySkills?: boolean;
+  /**
    * `searchVisibility` is an OPTIONAL per-note predicate for `query-notes`'s
    * full-text `search`: matches are ranked and limited over only the notes it
    * accepts, so a scoped answer doesn't depend on notes the caller can't see
@@ -759,10 +765,12 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     tags?: string[];
     metadata?: Record<string, unknown>;
     wasPublished?: boolean;
+    wasSkill?: boolean;
     defaultTags?: string[];
   }): void => {
     enforceStrictWrite(store, shape, {
       isVisible: expandVisibility,
+      maySkills: opts?.maySkills === true,
       ...(opts?.mayChangePublished ? { mayChangePublished: opts.mayChangePublished() } : {}),
       bypass: strictBypass,
       onBypass: onStrictBypass
@@ -1752,7 +1760,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // (existing ∪ incoming), not the raw incoming item — a caller
           // updating one field of an already-conforming note shouldn't have
           // to re-supply every `required` field just to pass validation.
-          enforceStrict({ path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true });
+          enforceStrict({ path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true, wasSkill: hasSkillType(existingNote.tags) });
 
           // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): a
           // tags-only or links-only "update" leaves `updates` empty, so
@@ -2382,7 +2390,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               const projectedMeta = stItem !== undefined
                 ? { ...baseMeta, [stItem.field as string]: stItem.to }
                 : baseMeta;
-              enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: ((item.tags as any)?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true });
+              enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: ((item.tags as any)?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true, wasSkill: hasSkillType(note.tags) });
             }
 
             // vault#555 fix 2 — tag and link mutations must bump `updated_at`
@@ -3589,6 +3597,8 @@ export function enforceStrictWrite(
     metadata?: Record<string, unknown>;
     /** Whether the note was published (metadata.published) before this write. */
     wasPublished?: boolean;
+    /** Whether the note was a skill (type `skill`) before this write (skills.ts). */
+    wasSkill?: boolean;
     /** The tags whose schema defaults the write applies afterwards (all on a create, the added ones on an update). */
     defaultTags?: string[];
   },
@@ -3598,8 +3608,12 @@ export function enforceStrictWrite(
     isVisible?: (note: Note) => boolean;
     /** false: the write may not change `metadata.published` (a scoped pass without the published tag). */
     mayChangePublished?: boolean;
+    /** true: the caller may add, change or unmake a skill (an admin key, a pack install). Anything else refuses. */
+    maySkills?: boolean;
   },
 ): ValidationWarning[] {
+  // T-476: before any other check, so a refused skill write says why in its own words.
+  refuseSkillWrite(shape, opts?.maySkills);
   if (opts?.mayChangePublished === false) {
     // As it will be after the write: schema defaults fill fields the note
     // lacks (applySchemaDefaults, for `defaultTags`), so a default

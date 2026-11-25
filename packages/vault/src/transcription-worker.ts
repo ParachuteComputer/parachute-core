@@ -64,6 +64,7 @@ import {
   type TranscriptionProvider,
 } from "../core/src/transcription/provider.ts";
 import { ScribeHttpProvider } from "./transcription/providers/scribe-http.ts";
+import { hasSkillType } from "../core/src/skills.ts";
 
 /**
  * The in-body transcription markers.
@@ -306,6 +307,9 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     try {
       const note = await store.getNote(noteId);
       if (!note) return;
+      // T-476: a skill's body is instructions every connected AI may follow, and only an admin key may change it. A
+      // recording anyone attached never writes its words there; the transcript stays on the attachment.
+      if (hasSkillType(note.tags)) return;
       const update = transform(note);
       if (update === null) return;
 
