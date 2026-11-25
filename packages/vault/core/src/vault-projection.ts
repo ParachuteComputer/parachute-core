@@ -569,7 +569,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   // T-476: one line, not the five hints (`vault-info` still returns them): query-records' own description, which
   // every client reads with the tool list, says each filter, so the brief keeps its budget for what only it can say.
-  lines.push(w("`query-notes { type: \"X\" }` lists a type, subtypes too; the tool's description has every filter (`metadata` operators, `search`, `near`, `id`)."));
+  lines.push(w("`query-notes { type: \"X\" }` lists a type, subtypes too; its description and parameters list each filter (`metadata` operators, `search`, `near`, `id`)."));
 
   lines.push("");
   lines.push("## Refreshing context");
