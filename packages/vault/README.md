@@ -256,7 +256,7 @@ parachute-vault backup status                  # schedule, last run, destination
 
 **0.9 (T-318, T-407):** `tools/list` leads with eleven tools: `query-records`, `create-record`, `update-record`,
 `delete-record`, `list-types`, `vault-info`, `doctor`, `read-attachment`, `attachment-url`, `manage-types`,
-`manage-keys`, and `add-attachment` for a writer (T-476). The record tools speak `body` and `fields` for what the note tools call `content` and `metadata`. The
+`manage-keys`, and `add-attachment` for a writer (T-476), and `docs` at every level (T-476). The record tools speak `body` and `fields` for what the note tools call `content` and `metadata`. The
 names below stay listed and working as deprecated aliases through 0.9 and go at 1.0; each use is counted in the
 home's `run/deprecations.json` (`parachute changes` prints the counts).
 
@@ -265,6 +265,14 @@ home's `run/deprecations.json` (`parachute changes` prints the counts).
 **Graph**: `find-path` (BFS between two notes)
 **Vault**: `vault-info` (get/update description + stats)
 **Admin**: `prune-schema`, `doctor` (taxonomy/metadata integrity scan), `manage-token`
+**Docs** (T-476): `docs` reads Parachute's docs for the version this box runs, as markdown: `docs {search: "…"}`
+finds pages, `docs {topic: "fix/needs-admin"}` reads one (`/docs/v/<major.minor>/<topic>.md` on the site, else the
+latest page). Every refusal carries `docs`, the address of the page with its fix, and the connect-time brief names the
+tool and the version, with "X is out" when parachute.computer/latest.json says so (read in the background, at most every
+six hours). When the site can't be read, a short copy built into the program answers. A self-hoster points it at their
+own copy of the site with `docs:` / `  base_url: https://…` in `~/.parachute/vault/config.yaml` (or `PARACHUTE_DOCS_URL`,
+which wins); `off` in either removes the tool, the brief's line, the `docs` field and the latest.json check.
+
 **Attachments** (present when the door wires an attachment-ticket provider — always true on this server): `attachment-url` (`action: "upload" | "download"`; the 0.8 names `request-attachment-upload`, `request-attachment-download` stay as deprecated aliases) — mint a short-lived, single-use ticket a runtime's shell spends directly at `/vault/{name}/tickets/{id}`; their bytes never pass through the tool call. `add-attachment` stores a small file (up to 80 KiB) whose bytes come in the call itself, for an AI whose runtime can't reach the ticket URL, such as Claude's code sandbox. See [`docs/HTTP_API.md`](./docs/HTTP_API.md#attachment-tickets-vault611-both-doors).
 
 ### Vault descriptions
