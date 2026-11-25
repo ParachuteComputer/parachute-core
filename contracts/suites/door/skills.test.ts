@@ -4,7 +4,7 @@
 // one, at every door, MCP and REST, and the refusal says why. Reading and following skills needs no admin.
 //
 // Written red first: before the rule a write key made, changed and unmade skills on both doors.
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { door, fp, lacks, mcp, refusal, rest, runId } from "./_door.ts";
 
 const is09 = door().release.startsWith("0.9");
@@ -24,6 +24,21 @@ async function refused(c: Awaited<ReturnType<typeof mcp>>, name: string, args: R
   if (r instanceof Error) return { refused: true, type: (r as any).data?.error_type ?? null, text: r.message };
   return { refused: false, type: null, text: JSON.stringify(r).slice(0, 200) };
 }
+
+// The door vault is shared by every contract file, in whatever order the runner takes them: a skill left behind would
+// add the Skills section to the brief another file fingerprints. So the skill records made here go when this file ends.
+afterAll(async () => {
+  if (!is09) return;
+  const admin = await mcp("admin").catch(() => null);
+  if (!admin) return;
+  try {
+    const left = await admin.call("query-records", { type: "skill", limit: 500 });
+    const ids = (Array.isArray(left) ? left : left.records ?? []).map((r: any) => r.id);
+    if (ids.length) await admin.call("delete-record", { ids });
+  } finally {
+    await admin.close();
+  }
+});
 
 describe.skipIf(!is09 || lacks("skill-guard"))("skills: only an admin key adds or changes one", () => {
   test("over MCP: a write key can't make, change or unmake a skill, and the refusal says why; admin can; anyone reads", async () => {
