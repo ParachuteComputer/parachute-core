@@ -57,7 +57,7 @@ describe.skipIf(!vault)("account door docs links = vault door docs links", () =>
   });
   test("a refusal gains docs, and its text block still equals structuredContent", () => {
     const r = hub.withRefusalDocs(refused("unknown_tool"), ctx);
-    expect((r.structuredContent as Record<string, unknown>).docs).toBe("https://docs.example/x/docs/v/0.9/fix/needs-admin/");
+    expect((r.structuredContent as Record<string, unknown>).docs).toBe("https://docs.example/x/docs/v/0.9/fix/needs-admin/#a-tool-it-cant-see");
     expect(JSON.parse(r.content[0]!.text as string)).toEqual(r.structuredContent);
   });
 });

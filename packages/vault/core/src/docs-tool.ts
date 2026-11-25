@@ -34,7 +34,7 @@ const MAX_BYTES = 200 * 1024;
 const TIMEOUT_MS = 8000;
 /** A page name: lower-case words joined by `-`, in at most three folders (`build/reference/mcp`). */
 const TOPIC_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*){0,2}$/;
-const ANCHOR_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const ANCHOR_RE = /^[a-z0-9_]+(?:-[a-z0-9_]+)*$/;
 
 // Short on purpose: every tool's description is read before the first call (the budget in contracts/suites/mcp/budget.test.ts).
 export const DOCS_DESCRIPTION = "Parachute's docs for this version, as markdown. `search` finds pages; `topic` reads one (a refusal's `docs` too).";
@@ -90,37 +90,50 @@ export function docsPageUrl(ctx: { origin: string; version?: string }, topic: st
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * The page with the fix for each refusal (`error_type`) and each warning `code` that has one. One list for every door
- * and the site: the site's `/docs/index.json` `errors` is checked equal to it (parachute.computer, the docs check).
- * A type not here points at `fix/refusals`, the page that lists every one.
+ * The page (and its section) with the fix for each refusal (`error_type`) and each warning `code` that has one. One
+ * list for every door and the site: it is the site's `/docs/index.json` `errors`, word for word, and the site's docs
+ * check holds the two equal (parachute.computer). A type not here points at `fix/refusals`, the page that lists every
+ * one.
  */
 export const REFUSAL_DOCS: Readonly<Record<string, string>> = {
-  // a key's level or reach: what admin is, and how the person grants it
-  unknown_tool: "fix/needs-admin",
-  insufficient_scope: "fix/needs-admin",
-  skill_needs_admin: "fix/needs-admin",
-  tag_scope_violation: "fix/needs-admin",
-  tag_in_use_by_tokens: "fix/needs-admin",
-  // a type that isn't there, or isn't one
-  tag_not_found: "fix/unknown-type",
-  unknown_tag: "fix/unknown-type",
-  tag_kind: "fix/unknown-type",
-  retype_conflict: "fix/unknown-type",
-  // a file over a limit, or of a kind the vault won't keep
-  inline_too_large: "fix/file-too-large",
-  file_too_large: "fix/file-too-large",
-  image_too_large: "fix/file-too-large",
-  blocked_upload_extension: "fix/file-too-large",
-  unsupported_attachment_type: "fix/file-too-large",
-  attachments_not_included: "fix/file-too-large",
-  storage_cap_exceeded: "fix/file-too-large",
-  // someone else changed it first
-  conflict: "fix/conflict",
-  precondition_required: "fix/conflict",
-  transition_conflict: "fix/conflict",
-  // not there
-  not_found: "fix/not-found",
-  ambiguous_path: "fix/not-found",
+  insufficient_scope: "fix/needs-admin#what-the-refusal-says",
+  unknown_tool: "fix/needs-admin#a-tool-it-cant-see",
+  skill_needs_admin: "fix/needs-admin#skills",
+  tag_scope_violation: "fix/needs-admin#a-key-limited-to-some-tags",
+  tag_in_use_by_tokens: "fix/needs-admin#a-key-limited-to-some-tags",
+  inline_too_large: "fix/file-too-large#in-a-chat-with-claude",
+  file_too_large: "fix/file-too-large#the-limits",
+  image_too_large: "fix/file-too-large#the-limits",
+  blocked_upload_extension: "fix/file-too-large#the-limits",
+  unsupported_attachment_type: "fix/file-too-large#claude-cant-read-the-file",
+  storage_cap_exceeded: "fix/file-too-large#on-parachute-cloud",
+  attachments_not_included: "fix/file-too-large#on-parachute-cloud",
+  tag_not_found: "fix/unknown-type#no-type-by-that-name",
+  unknown_tag: "fix/unknown-type#no-type-by-that-name",
+  tag_kind: "fix/unknown-type#a-tag-not-a-type",
+  schema_validation: "fix/unknown-type#a-field-doesnt-fit",
+  retype_conflict: "fix/unknown-type#a-field-doesnt-fit",
+  field_not_indexed: "fix/unknown-type#a-field-cant-be-counted",
+  conflict: "fix/conflict#conflict",
+  precondition_required: "fix/conflict#precondition_required",
+  transition_conflict: "fix/conflict#transition_conflict",
+  not_found: "fix/not-found#not_found",
+  ambiguous_path: "fix/not-found#ambiguous_path",
+  unknown_parameter: "fix/refusals#a-call-thats-not-right",
+  missing_required_field: "fix/refusals#a-call-thats-not-right",
+  invalid_query: "fix/refusals#a-call-thats-not-right",
+  invalid_request: "fix/refusals#a-call-thats-not-right",
+  mutually_exclusive: "fix/refusals#a-call-thats-not-right",
+  invalid_search_syntax: "fix/refusals#a-call-thats-not-right",
+  cursor_invalid: "fix/refusals#a-call-thats-not-right",
+  batch_too_large: "fix/refusals#a-call-thats-not-right",
+  path_conflict: "fix/refusals#a-name-thats-taken",
+  target_exists: "fix/refusals#a-name-thats-taken",
+  size_mismatch: "fix/refusals#a-file-that-didnt-arrive-whole",
+  digest_mismatch: "fix/refusals#a-file-that-didnt-arrive-whole",
+  semantic_unavailable: "fix/refusals#search-by-meaning-is-off",
+  plan_required: "fix/refusals#parachute-cloud-limits",
+  internal_error: "fix/refusals#something-broke",
 };
 
 /** The fix page for a refusal or warning type. */
@@ -131,7 +144,7 @@ const fixFor = (code: unknown): string | undefined => (typeof code === "string" 
 /** The person's step for a refusal only they can fix, when the refusal names none (T-476 eval). Checked against the
  *  approval page (one tick per level, packages/hub/src/oauth-ui.ts) and `parachute keys new … --can`. */
 export const PERSON_STEPS: Readonly<Record<string, string>> = {
-  insufficient_scope: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page.",
+  insufficient_scope: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page (for a script, a key made with that level).",
 };
 
 type Result = { content: { type: string; [k: string]: unknown }[]; structuredContent?: Record<string, unknown>; isError?: boolean; [k: string]: unknown };
@@ -394,7 +407,7 @@ function topicOf(raw: string, origin: string): { topic: string; anchor: string |
 }
 
 /** The slug a heading's anchor is (the site's: lower-case words joined by `-`). */
-const slug = (s: string) => s.toLowerCase().replace(/[`*_[\]()]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+const slug = (s: string) => s.toLowerCase().replace(/[`*[\]()'’]/g, "").replace(/[^a-z0-9_]+/g, "-").replace(/^-|-$/g, "");
 
 /** Only the section under the heading whose slug is `anchor`, down to the next heading as high; null when none is. */
 function section(markdown: string, anchor: string): string | null {
@@ -441,7 +454,7 @@ const STOP = new Set(["a", "an", "the", "to", "of", "in", "on", "for", "and", "o
  *  named exactly finds its fix page first. */
 function rank(pages: IndexPage[], query: string, limit = 5): IndexPage[] {
   const words = [...new Set((query.toLowerCase().match(WORD) ?? []).filter((w) => !STOP.has(w)))];
-  const fix = words.map(fixFor).find(Boolean);
+  const fix = words.map(fixFor).find(Boolean)?.split("#")[0];
   const stem = (w: string) => (w.length > 4 ? w.replace(/(ing|s)$/, "") : w);
   const hits = (text: string) => {
     const have = new Set((text.toLowerCase().match(WORD) ?? []).map(stem));
@@ -582,7 +595,7 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
         // The copy built in: when the site can't be read, and when it has no such page (yet: a site older than this
         // version, or a self-hoster's copy without the fix pages).
         const kept = OFFLINE_PAGES[topic];
-        const url = docsPageUrl({ origin, version: opts.version }, topic);
+        const url = docsPageUrl({ origin, version: opts.version }, anchor ? `${topic}#${anchor}` : topic);
         if (!kept && got === null) refuse(`No page "${topic}".`, "unknown_topic", "docs {search: \"<words>\"} finds a page; docs {} lists them");
         if (!kept) refuse(`The docs at ${url} couldn't be read (${(got as { unreachable: string }).unreachable}).`, "docs_unreachable", `open ${url} yourself, or try again`);
         const note = got === null ? `The site has no page at ${url}; this is the copy built into Parachute${opts.version ? ` ${opts.version}` : ""}.` : offlineNote(url, got.unreachable);

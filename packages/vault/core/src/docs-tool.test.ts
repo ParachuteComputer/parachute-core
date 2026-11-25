@@ -230,6 +230,10 @@ describe("the pages for the version this vault runs", () => {
     expect(whole.note).toBe('No section "#nope" on this page; here is all of it.');
     expect(whole.page).toBe("https://docs.example/docs/v/0.9/fix/needs-admin/");
     await expect(tool.execute({ topic: "fix/needs-admin#../x" })).rejects.toMatchObject({ error_type: "invalid_topic" });
+    // the site's own anchors: an error_type as a heading, and a heading with an apostrophe
+    const conflict = buildDocsTool({ origin: "https://docs.example", version: "0.9.1", fetch: site({ "/docs/v/0.9/fix/conflict.md": "# It changed\n\n## conflict\n\nRe-read.\n\n## precondition_required\n\nPass if_updated_at.\n\n## A tool it can't see\n\nLevels.\n" }).f, cache: new Map() });
+    expect(((await conflict.execute({ topic: "https://docs.example/docs/v/0.9/fix/conflict/#precondition_required" })) as { markdown: string }).markdown).toBe("## precondition_required\n\nPass if_updated_at.");
+    expect(((await conflict.execute({ topic: "fix/conflict#a-tool-it-cant-see" })) as { markdown: string }).markdown).toBe("## A tool it can't see\n\nLevels.");
   });
 });
 
@@ -269,18 +273,20 @@ describe("refusals and warnings point at their fix", () => {
   };
   test("every refusal gains docs, this version's fix page; the text block still equals structuredContent", () => {
     const r = withRefusalDocs(refused("insufficient_scope"), ctx);
-    expect(r.structuredContent).toEqual({ error_type: "insufficient_scope", message: "no", hint: "h", docs: "https://parachute.computer/docs/v/0.9/fix/needs-admin/" });
+    expect(r.structuredContent).toEqual({ error_type: "insufficient_scope", message: "no", hint: "h", docs: "https://parachute.computer/docs/v/0.9/fix/needs-admin/#what-the-refusal-says" });
     expect(JSON.parse(r.content[0]!.text as string)).toEqual(r.structuredContent);
     // one with no page of its own goes to the page that lists them all
-    expect(withRefusalDocs(refused("batch_too_large"), ctx).structuredContent!.docs).toBe("https://parachute.computer/docs/v/0.9/fix/refusals/");
+    expect(withRefusalDocs(refused("batch_too_large"), ctx).structuredContent!.docs).toBe("https://parachute.computer/docs/v/0.9/fix/refusals/#a-call-thats-not-right");
+    // one the map doesn't name goes to the page that lists them all
+    expect(withRefusalDocs(refused("history_unrecoverable"), ctx).structuredContent!.docs).toBe("https://parachute.computer/docs/v/0.9/fix/refusals/");
   });
   test("a level refusal with no next step of its own gains the person's step; one with a hint keeps its own", () => {
     const bare = { content: [{ type: "text", text: "{}" }], structuredContent: { error_type: "insufficient_scope", message: "needs admin" }, isError: true as const };
     expect(withRefusalDocs(bare, ctx).structuredContent).toEqual({
       error_type: "insufficient_scope",
       message: "needs admin",
-      hint: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page.",
-      docs: "https://parachute.computer/docs/v/0.9/fix/needs-admin/",
+      hint: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page (for a script, a key made with that level).",
+      docs: "https://parachute.computer/docs/v/0.9/fix/needs-admin/#what-the-refusal-says",
     });
     expect(withRefusalDocs(refused("insufficient_scope"), ctx).structuredContent!.hint).toBe("h");
     // a tool that isn't listed may be a typo: no admin step for it
@@ -288,9 +294,9 @@ describe("refusals and warnings point at their fix", () => {
     expect(withRefusalDocs(unknown, ctx).structuredContent!.hint).toBeUndefined();
   });
     test("the three walls: needs admin, a type that isn't there, a file too large", () => {
-    expect([REFUSAL_DOCS.unknown_tool, REFUSAL_DOCS.skill_needs_admin, REFUSAL_DOCS.tag_not_found, REFUSAL_DOCS.unknown_tag, REFUSAL_DOCS.inline_too_large, REFUSAL_DOCS.file_too_large]).toEqual(["fix/needs-admin", "fix/needs-admin", "fix/unknown-type", "fix/unknown-type", "fix/file-too-large", "fix/file-too-large"]);
+    expect([REFUSAL_DOCS.unknown_tool, REFUSAL_DOCS.skill_needs_admin, REFUSAL_DOCS.tag_not_found, REFUSAL_DOCS.unknown_tag, REFUSAL_DOCS.inline_too_large, REFUSAL_DOCS.file_too_large]).toEqual(["fix/needs-admin#a-tool-it-cant-see", "fix/needs-admin#skills", "fix/unknown-type#no-type-by-that-name", "fix/unknown-type#no-type-by-that-name", "fix/file-too-large#in-a-chat-with-claude", "fix/file-too-large#the-limits"]);
     // every page the map names has an offline copy
-    for (const topic of new Set(Object.values(REFUSAL_DOCS))) expect(OFFLINE_PAGES[topic]?.body).toBeString();
+    for (const topic of new Set(Object.values(REFUSAL_DOCS).map((t) => t.split("#")[0]!))) expect({ topic, body: typeof OFFLINE_PAGES[topic]?.body }).toEqual({ topic, body: "string" });
     expect(OFFLINE_PAGES["fix/refusals"]?.body).toBeString();
   });
   test("only the map's own keys: an error_type or code named like an object's own property gets the list page", () => {
@@ -307,8 +313,8 @@ describe("refusals and warnings point at their fix", () => {
     expect(withRefusalDocs(own, ctx)).toBe(own);
   });
   test("a warning with a fix page gains docs; others don't", () => {
-    const reply = { records: [], warnings: [{ code: "unknown_tag", message: "m", tag: "movie" }, { code: "unknown_parameter", field: "x" }] };
-    expect(withWarningDocs(reply, ctx)).toEqual({ records: [], warnings: [{ code: "unknown_tag", message: "m", tag: "movie", docs: "https://parachute.computer/docs/v/0.9/fix/unknown-type/" }, { code: "unknown_parameter", field: "x" }] });
+    const reply = { records: [], warnings: [{ code: "unknown_tag", message: "m", tag: "movie" }, { code: "truncated", field: "x" }] };
+    expect(withWarningDocs(reply, ctx)).toEqual({ records: [], warnings: [{ code: "unknown_tag", message: "m", tag: "movie", docs: "https://parachute.computer/docs/v/0.9/fix/unknown-type/#no-type-by-that-name" }, { code: "truncated", field: "x" }] });
     const none = { records: [] };
     expect(withWarningDocs(none, ctx)).toBe(none);
     expect(withWarningDocs(reply, { origin: null, version: "0.9.0" })).toBe(reply);

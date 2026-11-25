@@ -31,7 +31,7 @@ describe.skipIf(!is09)("docs: where the fix is, for this version", () => {
       expect(r.isError).toBe(true);
       const refusal = r.structuredContent;
       expect(refusal.error_type).toBe("unknown_tool");
-      expect(refusal.docs).toMatch(/\/fix\/needs-admin\/$/);
+      expect(refusal.docs).toMatch(/\/fix\/needs-admin\/#a-tool-it-cant-see$/);
       // the address, as given, is a topic the tool takes
       const page: any = await c.client.callTool({ name: "docs", arguments: { topic: refusal.docs } });
       expect(page.isError).toBeFalsy();
@@ -62,7 +62,7 @@ describe.skipIf(!is09)("docs: where the fix is, for this version", () => {
     try {
       const refused = await c.refused("list-types", { name: "docs-contract-no-such-type" });
       expect(refused?.error_type).toBe("tag_not_found");
-      expect(refused.docs).toMatch(/\/fix\/unknown-type\/$/);
+      expect(refused.docs).toMatch(/\/fix\/unknown-type\/#no-type-by-that-name$/);
       const listed: any = await c.call("query-records", { type: "docs-contract-no-such-type" });
       const warning = (listed.warnings ?? []).find((w: any) => w.code === "unknown_tag");
       expect(warning?.docs).toBe(refused.docs);

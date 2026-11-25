@@ -32,7 +32,7 @@ function oneShape(label: string, body: any, type: string, print = true) {
   expect(r.content[0].type).toBe("text");
   expect(JSON.parse(r.content[0].text)).toEqual(sc);
   // T-476: every refusal names the page with its fix, for the version this door runs
-  expect({ label, docs: typeof sc.docs === "string" && /^https?:\/\/\S+\/docs\/(v\/\d+\.\d+\/)?fix\/[a-z-]+\/$/.test(sc.docs) }).toEqual({ label, docs: true });
+  expect({ label, docs: typeof sc.docs === "string" && /^https?:\/\/\S+\/docs\/(v\/\d+\.\d+\/)?fix\/[a-z-]+\/(#[a-z0-9_-]+)?$/.test(sc.docs) }).toEqual({ label, docs: true });
   if (print) fp(`refusals/${label}`, { type: sc.error_type, keys: Object.keys(sc).sort() });
   return sc;
 }
@@ -97,7 +97,7 @@ describe("one way to refuse", () => {
       expect(above.message.replace("create-record", "<tool>")).toBe(none.message.replace("no-such-tool", "<tool>"));
       expect(above.message).toMatch(/can read; tools that write or need admin aren't listed/);
       expect(above.docs).toBe(none.docs);
-      expect(above.docs).toMatch(/\/fix\/needs-admin\/$/);
+      expect(above.docs).toMatch(/\/fix\/needs-admin\/#a-tool-it-cant-see$/);
       // the protocol's own errors stay JSON-RPC errors
       const bad = await safeFetch(url, {
         method: "POST",
