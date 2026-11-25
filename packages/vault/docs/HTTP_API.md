@@ -3040,11 +3040,10 @@ extension (`io.modelcontextprotocol/files`, draft):
   hand needs the check. A model types about 4 KiB a minute, so an 80 KiB
   file is a call of about 20 minutes; with network, `attachment-url` is
   faster for anything but a small file.
-- Refusals take this vault's usual shape, a JSON-RPC error with
-  `data.error_type`, like every other tool's. The extension asks for a tool
-  result with `isError: true` for a failed size, digest or quota check; a
-  client written to it reads these from the error instead. Which shape 1.0
-  keeps is open (the T-476 proposal).
+- Refusals take every tool's shape (MCP refusals, above): a tool result with
+  `isError: true` and `structuredContent {error_type, message, ...}`
+  (`digest_mismatch`, `size_mismatch`, `inline_too_large`, ...), as the
+  extension asks for a failed size, digest or quota check.
 - The account door (`/account/mcp`) doesn't list it, so an AI stores a file
   through the vault it is connected to (the writer's tool list there keeps
   the 4,000-token budget). A call naming it there still reaches the vault,

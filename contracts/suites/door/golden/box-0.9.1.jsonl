@@ -66,10 +66,10 @@
 {"key":"exit/file.vault.yaml.keys","value":["export_format_version","exported_at","name"]}
 {"key":"exit/http.headers","value":{"disposition":"attachment; filename=\"vault-<v>-<time>.tar\"","type":"application/x-tar"}}
 {"key":"files/add-attachment.annotations","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
-{"key":"files/add-attachment.refusal.digest","value":{"isError":true,"text":"{\n  \"error_type\": \"digest_mismatch\",\n  \"message\": \"file.data doesn't match file."}}
-{"key":"files/add-attachment.refusal.no-record","value":{"isError":true,"text":"{\n  \"error_type\": \"not_found\",\n  \"message\": \"Note not found: \\\"files852830e9/no-"}}
-{"key":"files/add-attachment.refusal.size","value":{"isError":true,"text":"{\n  \"error_type\": \"size_mismatch\",\n  \"message\": \"file.data decodes to 4104 bytes"}}
-{"key":"files/add-attachment.refusal.too-large","value":{"isError":true,"text":"{\n  \"error_type\": \"inline_too_large\",\n  \"message\": \"The file (1048576 bytes) is "}}
+{"key":"files/add-attachment.refusal.digest","value":{"field":"file.digest","isError":true,"type":"digest_mismatch"}}
+{"key":"files/add-attachment.refusal.no-record","value":{"field":"record","isError":true,"type":"not_found"}}
+{"key":"files/add-attachment.refusal.size","value":{"field":"file.size","isError":true,"type":"size_mismatch"}}
+{"key":"files/add-attachment.refusal.too-large","value":{"field":"file.size","isError":true,"type":"inline_too_large"}}
 {"key":"files/add-attachment.result.shape","value":{"attachment":{"id":"string","mime_type":"string","path":"string","size":"number"},"record":"string"}}
 {"key":"files/add-attachment.schema","value":{"properties":{"file":{"properties":{"data":{"type":"string"},"digest":{"properties":{"algorithm":{"const":"sha-256"},"value":{"description":"base64url or hex","type":"string"}},"required":["algorithm","value"],"type":"object"},"id":{"type":"string"},"mimeType":{"type":"string"},"name":{"type":"string"},"size":{"type":"integer"}},"required":["id","mimeType","size","digest"],"type":"object"},"record":{"type":"string"},"transcribe":{"type":"boolean"}},"required":["record","file"],"type":"object"}}
 {"key":"files/attach.reply.shape","value":{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}}

@@ -82,7 +82,7 @@ describe.skipIf(!is09)("the record door over MCP", () => {
         (e) => e,
       );
       expect(stale, "a write with the token read before another write is refused").not.toBeNull();
-      expect(String(stale?.data?.error_type ?? stale?.message)).toMatch(/conflict/);
+      expect(stale?.refusal?.error_type ?? stale?.data?.error_type).toBe("conflict");
       expect(one(await c.call("query-records", { id: path })).fields.status).toBe("done");
     } finally {
       await c.close();
