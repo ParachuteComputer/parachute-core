@@ -146,8 +146,40 @@ describe("add-attachment", () => {
     // No name: the type alone says what it is, and active content is still refused.
     const { name: _n, ...unnamed } = fileInput(bytes, { mimeType: "text/html" });
     expect((await add(vault, { record: note.id, file: unnamed })).refused?.error_type).toBe("blocked_upload_extension");
+    // A passive name doesn't launder an active type.
+    const disguised = await add(vault, { record: note.id, file: fileInput(bytes, { name: "a.txt", mimeType: "text/html" }) });
+    expect(disguised.refused?.error_type).toBe("blocked_upload_extension");
+    expect(disguised.refused?.field).toBe("file.mimeType");
+    expect((await add(vault, { record: "no/such/record", file: fileInput(bytes) })).refused?.field).toBe("record");
     expect((await add(vault, { note: note.id, file: fileInput(bytes) })).refused?.error_type).toBe("unknown_parameter");
     expect(await store.getAttachments(note.id)).toEqual([]);
+  });
+
+  test("a file's id never names the stored file: no blocked extension reaches disk", async () => {
+    const vault = freshVault("addatt-id");
+    const store = getVaultStore(vault);
+    const note = await store.createNote("# x\n", { path: "x" });
+    const bytes = new TextEncoder().encode("made up, not markup");
+    const { name: _n, ...unnamed } = fileInput(bytes, { id: "evil.html", mimeType: "application/octet-stream" });
+    const r = await add(vault, { record: note.id, file: unnamed });
+    expect(r.refused).toBeUndefined();
+    expect(r.attachment.path).not.toMatch(/\.(html|svg|js)$/);
+    const blank = await add(vault, { record: note.id, file: { ...fileInput(bytes, { id: "x.svg", mimeType: "text/plain" }), name: " " } });
+    expect(blank.attachment.path).not.toMatch(/\.svg$/);
+    const rows = await store.getAttachments(note.id);
+    expect(rows.map((a) => a.path).filter((p) => /\.(html|svg|js)$/.test(p))).toEqual([]);
+  });
+
+  test("a digest in plain base64 (+ and /) is taken as well as base64url", async () => {
+    const vault = freshVault("addatt-b64");
+    const note = await getVaultStore(vault).createNote("# x\n", { path: "x" });
+    // Find made-up bytes whose SHA-256 has a + or / in plain base64, so the two alphabets differ.
+    let bytes = new Uint8Array(randomBytes(200));
+    while (!/[+/]/.test(createHash("sha256").update(bytes).digest("base64"))) bytes = new Uint8Array(randomBytes(200));
+    const plain = createHash("sha256").update(bytes).digest("base64");
+    const r = await add(vault, { record: note.id, file: fileInput(bytes, { digest: { algorithm: "sha-256", value: plain } }) });
+    expect(r.refused).toBeUndefined();
+    expect(r.attachment.size).toBe(200);
   });
 
   test("a reader can't see or call it; a tag-scoped writer can't attach outside its scope", async () => {
@@ -192,9 +224,9 @@ describe("add-attachment", () => {
     expect(marked.inputSchema.properties.file["x-mcp-file"]).toEqual({ maxSize: MAX_INLINE_ATTACHMENT_BYTES });
   });
 
-  test("the connect-time brief tells an AI to use it when it holds the bytes", async () => {
+  test("the connect-time brief tells a writer to use it when it holds the bytes, and a reader nothing about it", async () => {
     const vault = freshVault("addatt-brief");
-    const md = await getServerInstruction(vault);
-    expect(md).toContain("`add-attachment` stores a file sent in the call");
+    expect(await getServerInstruction(vault, auth(WRITE))).toContain("`add-attachment` stores a file sent in the call");
+    expect(await getServerInstruction(vault, auth(["vault:read"]))).not.toContain("add-attachment");
   });
 });
