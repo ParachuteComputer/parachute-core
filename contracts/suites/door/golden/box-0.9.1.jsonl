@@ -425,7 +425,7 @@
 {"key":"rest/refusal.bad-credential","value":{"error":"Unauthorized","keys":["error","message"],"status":401}}
 {"key":"rest/refusal.bad-cursor","value":{"error":"(text)","hint":null,"keys":["code","error","error_type"],"status":400,"type":"cursor_invalid"}}
 {"key":"rest/refusal.batch-half-bad","value":{"error":"path_conflict","hint":"668620dee24032c3","keys":["error","error_type","hint","message","path"],"status":409,"type":"path_conflict"}}
-{"key":"rest/refusal.blind-update","value":{"error":"precondition_required","hint":"3c9c6b683ee4084a","keys":["error","error_type","hint","message","note_id","path"],"status":428,"type":"precondition_required"}}
+{"key":"rest/refusal.blind-update","value":{"error":"precondition_required","hint":"a4304fabc884d396","keys":["error","error_type","hint","message","note_id","path"],"status":428,"type":"precondition_required"}}
 {"key":"rest/refusal.describe-without-admin","value":{"error":"Forbidden","hint":null,"keys":["error","error_type","granted_scopes","message","required_scope"],"status":403,"type":"insufficient_scope"}}
 {"key":"rest/refusal.no-credential","value":{"error":"Unauthorized","keys":["error","message"],"status":401,"www":""}}
 {"key":"rest/refusal.no-such-note","value":{"error":"(text)","hint":null,"keys":["error","error_type"],"status":404,"type":"not_found"}}
