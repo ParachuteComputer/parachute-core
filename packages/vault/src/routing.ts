@@ -1370,6 +1370,8 @@ export async function route(
     via: auth.via,
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
     ...(typeWriteOnly ? { typeWriteOnly: true } : {}),
+    // T-476: only an admin key adds or changes a skill (core skills.ts).
+    maySkills: hasScopeForVault(auth.scopes, vaultName, "admin") && !(auth.scoped_tags && auth.scoped_tags.length > 0),
   };
 
   if (apiPath.startsWith("/notes") && recordsDoor) {

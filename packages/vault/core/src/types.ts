@@ -508,7 +508,10 @@ export interface Store {
        * update-note executor must not either. §10.24 pins that.
        */
       historyOp?: HistoryOp;
-      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[]; /** Scope gap 1: the writer's visibility (see SqliteStore.updateNote). */ linkVisible?: (noteId: string) => boolean }): Promise<Note>;
+      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[];
+      /** T-476: a rename may rewrite links in skills (records of type `skill`) only when the writer may write skills.
+       *  Anything but true leaves skills as they are (core skills.ts). */
+      maySkills?: boolean; /** Scope gap 1: the writer's visibility (see SqliteStore.updateNote). */ linkVisible?: (noteId: string) => boolean }): Promise<Note>;
   /**
    * Set a note's `created_at` and `updated_at` explicitly. Import-only:
    * used by the portable-md round-trip path to restore timestamps from

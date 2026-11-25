@@ -64,6 +64,7 @@ import {
   type TranscriptionProvider,
 } from "../core/src/transcription/provider.ts";
 import { ScribeHttpProvider } from "./transcription/providers/scribe-http.ts";
+import { isSkillTags, skillTypeNames } from "../core/src/skills.ts";
 
 /**
  * The in-body transcription markers.
@@ -306,6 +307,9 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     try {
       const note = await store.getNote(noteId);
       if (!note) return;
+      // T-476: a skill's body is instructions every connected AI may follow, and only an admin key may change it. A
+      // recording anyone attached never writes its words there; the transcript stays on the attachment.
+      if (isSkillTags(note.tags, skillTypeNames(store.db))) return;
       const update = transform(note);
       if (update === null) return;
 
@@ -325,6 +329,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       // write with the fresh precondition.
       const fresh = await store.getNote(noteId);
       if (!fresh) return;
+      if (isSkillTags(fresh.tags, skillTypeNames(store.db))) return; // it may have become a skill since the first read
       const reUpdate = transform(fresh);
       if (reUpdate === null) return;
 
@@ -344,6 +349,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       // the latest content. Otherwise skip — don't clobber the user.
       const latest = await store.getNote(noteId);
       if (!latest) return;
+      if (isSkillTags(latest.tags, skillTypeNames(store.db))) return; // as above: never into a skill's body
       if (!safeWithoutPrecondition(latest)) {
         logger.error(
           `[transcribe] ${op}: note ${noteId} kept changing under us (double conflict); skipping to avoid clobbering a concurrent edit`,

@@ -67,7 +67,7 @@ describe.skipIf(!is09)("the record door over MCP", () => {
     const c = await mcp("write");
     try {
       const words = (await c.tools()).find((t) => t.name === "update-record")?.description ?? "";
-      const named = /`if_updated_at` \(the record's `(\w+)`/.exec(words)?.[1];
+      const named = /`if_updated_at` \(its `(\w+)` as read\)/.exec(words)?.[1];
       expect(named, words).toBeTruthy();
       const brief = c.client.getInstructions() ?? "";
       expect(/if_updated_at: record\.(\w+)/.exec(brief)?.[1], "the brief's live-page words name the same key").toBe(named!);

@@ -469,6 +469,8 @@ export async function migrateTagField(
       { path: note.path, tags: note.tags, metadata: nextMeta },
       {
         bypass: true,
+        // migrate needs admin at every door (and the CLI is the owner's), so it may change skills' fields.
+        maySkills: true,
         onBypass: opts.onStrictBypass
           ? (violations) =>
               opts.onStrictBypass!({
