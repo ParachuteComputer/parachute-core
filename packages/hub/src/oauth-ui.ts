@@ -1184,7 +1184,7 @@ function renderScopeRow(scope: string, displayScope: string = scope, interactive
   // An account-wide scope gets an explicit consequence line, not just a colour.
   // Colour alone is invisible to a screen reader and to anyone who doesn't
   // know the convention, and this is the decision most worth slowing down.
-  const riskNote = scopeRiskNote(lookup, explanation, risk);
+  const riskNote = scopeRiskNote(lookup, explanation, risk, interactive);
   // One checkbox per requested scope — granular consent. Pre-checked for
   // ordinary scopes (the app asked for them and approving is the common case),
   // but a `high` tier scope starts UNCHECKED: account-wide authority should be
@@ -1267,10 +1267,17 @@ function renderGrantableExtras(extras: readonly string[], expanded: boolean): st
  * The consequence line under a scope: account-wide reach (`accountWideRiskNote`), else, for an admin scope, that it
  * is powerful and why. Words, not only colour, for the same reasons as the account-wide line.
  */
-function scopeRiskNote(scope: string, explanation: ScopeExplanation, risk: "low" | "elevated" | "high"): string {
+function scopeRiskNote(
+  scope: string,
+  explanation: ScopeExplanation,
+  risk: "low" | "elevated" | "high",
+  withBox = true,
+): string {
   const wide = accountWideRiskNote(scope, risk);
   if (wide || explanation.level !== "admin") return wide;
-  return `<span class="scope-risk-note scope-risk-admin"><strong>Powerful.</strong> The app could change how the vault works and make keys of its own. Tick it only if you want this app to manage the vault.</span>`;
+  // A row with no box (the sign-in page before consent) says what admin is, not what to tick.
+  const tick = withBox ? " Tick it only if you want this app to manage the vault." : "";
+  return `<span class="scope-risk-note scope-risk-admin"><strong>Powerful.</strong> The app could change how the vault works and make keys of its own.${tick}</span>`;
 }
 
 /**

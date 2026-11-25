@@ -463,6 +463,24 @@ describe("renderConsent", () => {
     expect(html).not.toContain("registered itself");
   });
 
+  // T-476 claudereal: admin starts unticked and says why it is powerful; Parachute's own app keeps it ticked.
+  test("an admin row starts unticked with the powerful line; read and write stay ticked", () => {
+    const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "Claude", scopes: ["vault:work:read", "vault:work:write", "vault:work:admin"], sameHub: false });
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:read" checked />');
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:write" checked />');
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:admin" />');
+    expect(html).toContain("<strong>Powerful.</strong> The app could change how the vault works and make keys of its own. Tick it only if you want this app to manage the vault.");
+  });
+  test("Parachute's own app keeps the admin it asked for ticked", () => {
+    const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "Parachute", scopes: ["vault:work:admin"], sameHub: false, parachuteApp: "device" });
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:admin" checked />');
+  });
+  test("the sign-in page before consent says admin is powerful, with nothing to tick", () => {
+    const html = renderApprovePending({ clientName: "Claude", clientId: "c", redirectUris: ["https://app.example/cb"], requestedScopes: ["vault:read", "vault:admin"], requestedVault: null, hubOrigin: "https://hub.example", approveForm: null, loginNextUrl: "/" } as unknown as Parameters<typeof renderApprovePending>[0]);
+    expect(html).toContain("<strong>Powerful.</strong>");
+    expect(html).not.toContain("Tick it only");
+  });
+
   // T-476: plain words for an app that registered itself (claude.ai always does), no "External", "third-party" or red.
   test("renders the self-registered trust marker for a DCR client, in plain words", () => {
     const html = renderConsent({
