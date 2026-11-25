@@ -7,9 +7,10 @@
  * the routing the SDK documents for "keep the existing legacy wiring beside a strict modern endpoint"
  * (`isLegacyRequest`). 2025-era requests never reach this file, so existing clients see no change.
  *
- * Both eras serve the same tools (`toolSurface` in mcp-http.ts) and the same instructions. Only this era adds the
- * Skills extension (mcp-skills.ts). Two SDKs side by side is a step, not the end: the 2025 path moves onto SDK v2 too
- * (`legacy: "stateless"`) and the 1.x wiring goes, one server for both eras (T-476 subtract line, by 12-18).
+ * Both eras serve the vault's tools (`toolSurface` in mcp-http.ts) and the same instructions. The 2025 era adds the
+ * approved applets (mcp-app.ts); this era the Skills extension (mcp-skills.ts). Two SDKs side by side is a step, not
+ * the end: the 2025 path moves onto SDK v2 too (`legacy: "stateless"`) and the 1.x wiring goes, one server for both
+ * eras (T-476 subtract line, by 12-18).
  */
 
 import { createMcpHandler, isLegacyRequest, McpServer } from "@modelcontextprotocol/server";

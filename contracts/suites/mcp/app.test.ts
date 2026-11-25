@@ -77,6 +77,19 @@ describe("mcp/app: the person's approved applets as an MCP App", () => {
     expect(t.inputSchema).toEqual({ type: "object", properties: {} });
   });
 
+  test("a 2026-07-28 connection lists no applet: its resources are the skills', so it has no ui:// view to give", async () => {
+    const MODERN = "2026-07-28";
+    const r = await safeFetch(`${s.vaultViaHub}/mcp`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${await pass({ level: "read" })}`, "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": MODERN, "mcp-method": "tools/list" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: { "io.modelcontextprotocol/protocolVersion": MODERN, "io.modelcontextprotocol/clientCapabilities": {}, "io.modelcontextprotocol/clientInfo": { name: "parachute-contracts", version: "0" } } } }),
+    });
+    const body: any = await r.json();
+    const names: string[] = body.result.tools.map((t: any) => t.name);
+    expect(names).toContain("query-records"); // the 2026-07-28 door answered
+    expect(names.filter((n) => n.startsWith("open-"))).toEqual([]);
+  });
+
   test("its view is the applet host with this applet's record and code in it", async () => {
     const list = await reader.client.listResources();
     expect(list.resources.filter((r) => r.uri.endsWith(tag)).map((r) => r.uri)).toEqual([`ui://parachute/applet/${ids.ok}`]);
