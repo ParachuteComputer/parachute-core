@@ -25,12 +25,12 @@ export const FILES_EXTENSION = "io.modelcontextprotocol/files";
  *
  * Measured, not guessed (T-476, 2026-11-24): a Claude model fills `file.data`
  * by typing the base64 itself, and random base64 costs about one output token
- * per character. Claude Opus retyped 16 KiB (22,136 base64 characters) and
- * 24 KiB (33,200) into one tool argument byte for byte; at 32 KiB
- * (44,267 characters) the call no longer fits one reply. So the cap is 24 KiB.
- * An agent with network access sends a larger file through `attachment-url`.
+ * per character. Claude Opus 5.5 retyped 16, 24, 32, 40, 56 and 80 KiB of random bytes into one
+ * tool argument byte for byte (SHA-256 checked); the cap is the largest that
+ * came back exact. An agent with network access sends a larger file through
+ * the ticket URL (`attachment-url`; `request-attachment-upload` on 0.8).
  */
-export const MAX_INLINE_ATTACHMENT_BYTES = 24 * 1024;
+export const MAX_INLINE_ATTACHMENT_BYTES = 80 * 1024;
 
 /**
  * The `file` argument's schema: the extension's FileInput, marked `x-mcp-file`. A door shows the marker only to a
@@ -68,11 +68,10 @@ function refuse(message: string, fields: Refusal): never {
 }
 
 const HINT_DIGEST =
-  "digest.value is the file's SHA-256 in base64url without padding (`openssl dgst -sha256 -binary f | basenc --base64url | tr -d =`); hex (`sha256sum f`) is taken too";
+  "digest.value is the file's SHA-256 in base64url without padding (`openssl dgst -sha256 -binary f | basenc --base64url | tr -d =`); hex (`sha256sum f`) and plain base64 are taken too";
 
 /** RFC 4648 base64 (padding optional; line breaks and spaces ignored) → bytes, or null when it isn't base64. */
-function decodeBase64(data: string): Uint8Array | null {
-  const clean = data.replace(/\s+/g, "");
+function decodeBase64(clean: string): Uint8Array | null {
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(clean) || clean.length % 4 === 1) return null;
   const padded = clean.replace(/=+$/, "");
   let binary: string;
@@ -154,9 +153,12 @@ export async function readInlineFile(
       hint: `send the bytes as file.data (base64, up to ${maxBytes} bytes), or use ${uploadTool} if your runtime can reach this host`,
     });
   }
-  // A base64 string longer than any file under the cap could need is refused before it is decoded.
-  const data = f.data as string;
-  if (data.replace(/\s+/g, "").length > Math.ceil(maxBytes / 3) * 4) {
+  // A base64 string longer than any file under the cap could need is refused before it is copied or decoded (the
+  // raw length first, with room for line breaks; then without whitespace).
+  const raw = f.data as string;
+  const longest = Math.ceil(maxBytes / 3) * 4;
+  const data = raw.length > longest * 1.1 + 1024 ? null : raw.replace(/\s+/g, "");
+  if (data === null || data.length > longest) {
     refuse(`The file is over the ${maxBytes} byte limit for a file sent in the call`, {
       error_type: "inline_too_large",
       field: "file.data",
@@ -167,6 +169,16 @@ export async function readInlineFile(
   const bytes = decodeBase64(data);
   if (!bytes) {
     refuse("`file.data` isn't base64", { error_type: "invalid_query", field: "file.data", hint: "RFC 4648 base64 (A-Z a-z 0-9 + /, = padding), e.g. the output of `base64 -w0 f`" });
+  }
+  // The length bound above is coarse (base64 comes in 3-byte steps); the decoded length is the exact cap.
+  if (bytes.length > maxBytes) {
+    refuse(`The file (${bytes.length} bytes) is over the ${maxBytes} byte limit for a file sent in the call`, {
+      error_type: "inline_too_large",
+      field: "file.data",
+      limit: maxBytes,
+      got: bytes.length,
+      hint: `use ${uploadTool} and PUT the bytes to its URL, if your runtime can reach this host`,
+    });
   }
   if (bytes.length !== size) {
     refuse(`file.data decodes to ${bytes.length} bytes, but file.size says ${size}`, {
@@ -179,7 +191,10 @@ export async function readInlineFile(
   }
   const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as unknown as ArrayBuffer));
   const want = (digest!.value as string).trim();
-  const matches = /^[0-9a-fA-F]{64}$/.test(want) ? want.toLowerCase() === hex(sum) : want.replace(/=+$/, "") === base64url(sum);
+  // base64url as the extension says, plain base64 (`+/`) as a shell's `base64` prints it, or hex as `sha256sum` does.
+  const matches = /^[0-9a-fA-F]{64}$/.test(want)
+    ? want.toLowerCase() === hex(sum)
+    : want.replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_") === base64url(sum);
   if (!matches) {
     refuse("file.data doesn't match file.digest: the bytes changed on the way", {
       error_type: "digest_mismatch",

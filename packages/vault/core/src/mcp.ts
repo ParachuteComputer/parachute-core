@@ -3063,18 +3063,32 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           });
         }
         const file = await readInlineFile(params.file, MAX_INLINE_ATTACHMENT_BYTES, "request-attachment-upload");
-        const note = requireNote(db, noteRef, resolveVisibility);
+        const note = resolveNote(db, noteRef, resolveVisibility);
+        if (!note) throw structuredError(`Note not found: "${noteRef}"`, { error_type: "not_found", field: "record" });
         if (ticketSeam.noteVisible && !(await ticketSeam.noteVisible(note))) {
           throw structuredError(`Note not found: "${noteRef}"`, { error_type: "not_found", field: "record" });
         }
         const typed = file.mimeType.split(";")[0]!.trim().toLowerCase();
-        const fromName = file.name ? sanitizeAttachmentExtension(file.name) : "";
-        // No name: an extension from the media type, so the stored file is served as what it is.
-        const ext = fromName || BLOCKED_ATTACHMENT_MIME_EXTENSIONS[typed] || (Object.entries(ATTACHMENT_MIME_TYPES).find(([, m]) => m === typed)?.[0] ?? "");
-        if (BLOCKED_ATTACHMENT_EXTENSIONS.has(ext) || BLOCKED_ATTACHMENT_MIME_EXTENSIONS[typed]) {
+        // Active content is refused by its type as well as by its name: `text/html` named `a.txt` too.
+        const blockedType = BLOCKED_ATTACHMENT_MIME_EXTENSIONS[typed];
+        if (blockedType) {
+          throw structuredError(`File type ${typed} not allowed (active/executable content)`, {
+            error_type: "blocked_upload_extension",
+            field: "file.mimeType",
+            extension: blockedType,
+            how_to: "send it as text/plain or another passive type, or store the content as record text instead",
+          });
+        }
+        // The stored name is the file's own, or with none a fixed stem and the extension of its media type, so the
+        // stored file is served as what it is. Never `file.id`: a label like "x.html" would put a blocked extension on
+        // disk. The blocklist runs on the name that is actually stored.
+        const typeExt = Object.entries(ATTACHMENT_MIME_TYPES).find(([, m]) => m === typed)?.[0] ?? "";
+        const filename = file.name ?? `file${typeExt}`;
+        const ext = sanitizeAttachmentExtension(filename);
+        if (BLOCKED_ATTACHMENT_EXTENSIONS.has(ext)) {
           throw structuredError(`File type ${ext} not allowed (active/executable content)`, {
             error_type: "blocked_upload_extension",
-            field: fromName ? "file.name" : "file.mimeType",
+            field: "file.name",
             extension: ext,
             how_to: "rename with a non-executable extension, or store the content as record text instead",
           });
@@ -3089,7 +3103,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           createdAt: now,
           expiresAt: now + computeTicketTtlMs(file.bytes.length),
           noteId: note.id,
-          filename: file.name ?? `${String((params.file as { id?: unknown }).id ?? "file")}${ext}`,
+          filename,
           mimeType,
           sizeBytes: file.bytes.length,
           transcribe: params.transcribe === true,

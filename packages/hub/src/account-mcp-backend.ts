@@ -276,8 +276,9 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
             !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string",
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))
-        // T-476: add-attachment (a file sent in the call) stays at the vault's own address, as on 0.9; an AI stores a file
-        // through the vault it was connected to, and Cloud's account door has no attachment tools.
+        // T-476: add-attachment (a file sent in the call) isn't listed here, as on 0.9: an AI stores a file through the
+        // vault it was connected to, and Cloud's account door has no attachment tools. A call naming it still reaches the
+        // vault, which checks the write verb.
         .filter((t) => t.name !== "add-attachment")
         .map(injectVaultSelector);
     } catch {

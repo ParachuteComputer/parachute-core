@@ -138,7 +138,7 @@ export async function getServerInstruction(
     // `generateScopedMcpTools` below) — the connect-time brief can
     // unconditionally teach both the ticket tools and read-attachment on
     // this door.
-    attachments: { ticketsEnabled: true, readEnabled: true, addEnabled: true },
+    attachments: { ticketsEnabled: true, readEnabled: true, addEnabled: !auth || hasScopeForVault(auth.scopes, vaultName, "write") },
   });
 }
 

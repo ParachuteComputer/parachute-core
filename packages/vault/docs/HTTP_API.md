@@ -2648,16 +2648,18 @@ not reach the ticket URL, but its MCP calls always arrive. `add-attachment
 
 - Checked before anything is stored: `size` must be the decoded length
   (`size_mismatch`), the SHA-256 must match (`digest_mismatch`), and the file
-  must be at most 24 KiB (`inline_too_large`, with a hint naming
-  `request-attachment-upload`). The cap is what a Claude model was measured
-  to type into one call byte for byte (2026-11-24). Active content is refused
-  by name or, with no name, by type (`blocked_upload_extension`); a missing
-  record is `not_found`.
+  must be at most 80 KiB (`inline_too_large`, with a hint naming
+  `request-attachment-upload`). The cap is the largest file a Claude model
+  was measured to retype into one call byte for byte (16 to 80 KiB, all
+  exact, 2026-11-24). Active content is refused by name and by type
+  (`blocked_upload_extension`); with no name the file is stored as `file`
+  plus its type's extension (`id` is only a label). A missing record is
+  `not_found` with `field: "record"`.
 - Stored by the same writer as a spent upload ticket. Returns
   `{attachment: {id, path, mime_type, size}, record}`.
 - The `file` schema is marked `x-mcp-file` only for a `tools/list` whose
   `_meta` declares the extension; other clients see it unmarked, so a model
-  can fill it itself. Not on the account door. Same tool on 0.9.
+  can fill it itself. Not listed on the account door. Same tool on 0.9.
 
 ### MCP
 
