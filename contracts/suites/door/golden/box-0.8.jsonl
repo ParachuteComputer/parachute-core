@@ -56,6 +56,13 @@
 {"key":"exit/file.exit-fixture/target.md","value":"---\nid: <id>\npath: exit-fixture/target\nattachments:\n  - id: <id>\n    mime_type: image/png\n    path: <stored>.png\ncreated_at: <time>\nupdated_at: <time>\n---\nThe target.\n"}
 {"key":"exit/file.pathless","value":{"name":"_unpathed/exit-fixture pathless note.md","text":"---\nid: <id>\ntags:\n  - exit/nested-tag\ncreated_at: <time>\nupdated_at: <time>\n---\nexit-fixture pathless note\n"}}
 {"key":"exit/file.vault.yaml.keys","value":["description","export_format_version","exported_at","name"]}
+{"key":"files/add-attachment.annotations","value":null}
+{"key":"files/add-attachment.refusal.digest","value":{"code":-32602,"field":"file.digest","type":"digest_mismatch"}}
+{"key":"files/add-attachment.refusal.no-record","value":{"code":-32602,"field":"record","type":"not_found"}}
+{"key":"files/add-attachment.refusal.size","value":{"code":-32602,"field":"file.size","type":"size_mismatch"}}
+{"key":"files/add-attachment.refusal.too-large","value":{"code":-32602,"field":"file.size","type":"inline_too_large"}}
+{"key":"files/add-attachment.result.shape","value":{"attachment":{"id":"string","mime_type":"string","path":"string","size":"number"},"record":"string"}}
+{"key":"files/add-attachment.schema","value":{"properties":{"file":{"properties":{"data":{"type":"string"},"digest":{"properties":{"algorithm":{"const":"sha-256"},"value":{"description":"base64url or hex","type":"string"}},"required":["algorithm","value"],"type":"object"},"id":{"type":"string"},"mimeType":{"type":"string"},"name":{"type":"string"},"size":{"type":"integer"}},"required":["id","mimeType","size","digest"],"type":"object"},"record":{"description":"The record's id or path","type":"string"},"transcribe":{"description":"Transcribe an audio file, as request-attachment-upload does","type":"boolean"}},"required":["record","file"],"type":"object"}}
 {"key":"files/attach.reply.shape","value":{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}}
 {"key":"files/attachments.list.shape","value":[{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}]}
 {"key":"files/detach.reply","value":{"shape":"null","status":204}}
@@ -73,6 +80,7 @@
 {"key":"files/upload.pdf","value":{"status":201}}
 {"key":"files/upload.reply.shape","value":{"mimeType":"string","path":"string","size":"number"}}
 {"key":"files/upload.txt","value":{"status":201}}
+{"key":"has/add-attachment","value":true}
 {"key":"has/export-over-http","value":false}
 {"key":"has/oauth-approval","value":true}
 {"key":"history/deleted.shape","value":{"notes":[{"deleted_at":"string","extension":"string","id":"string","path":"string","versions":"number"}],"total":"number"}}
@@ -88,7 +96,11 @@
 {"key":"mcp/admin.capabilities","value":["tools"]}
 {"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
 {"key":"mcp/admin.server.name","value":"parachute-vault/<v>"}
-{"key":"mcp/admin.tool-count","value":17}
+{"key":"mcp/admin.tool-count","value":18}
+{"key":"mcp/admin.tool.add-attachment.hints","value":null}
+{"key":"mcp/admin.tool.add-attachment.present","value":true}
+{"key":"mcp/admin.tool.add-attachment.schema","value":"fc3188948fca8304"}
+{"key":"mcp/admin.tool.add-attachment.words","value":"f45168769bd16801"}
 {"key":"mcp/admin.tool.create-note.hints","value":null}
 {"key":"mcp/admin.tool.create-note.present","value":true}
 {"key":"mcp/admin.tool.create-note.schema","value":"2456b293b3061ebc"}
@@ -215,7 +227,11 @@
 {"key":"mcp/write.capabilities","value":["tools"]}
 {"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
 {"key":"mcp/write.server.name","value":"parachute-vault/<v>"}
-{"key":"mcp/write.tool-count","value":11}
+{"key":"mcp/write.tool-count","value":12}
+{"key":"mcp/write.tool.add-attachment.hints","value":null}
+{"key":"mcp/write.tool.add-attachment.present","value":true}
+{"key":"mcp/write.tool.add-attachment.schema","value":"fc3188948fca8304"}
+{"key":"mcp/write.tool.add-attachment.words","value":"f45168769bd16801"}
 {"key":"mcp/write.tool.create-note.hints","value":null}
 {"key":"mcp/write.tool.create-note.present","value":true}
 {"key":"mcp/write.tool.create-note.schema","value":"2456b293b3061ebc"}
