@@ -54,6 +54,9 @@ export const TOOL_ANNOTATIONS: Readonly<Record<string, McpToolAnnotations>> = {
   "delete-note": REMOVE,
   "attachment-url": ADD, // upload: a ticket that adds an attachment; download: as above; a reader's: BY_LEVEL
   "request-attachment-upload": ADD,
+  // Adds an attachment and never overwrites one; marked destructive because Claude's connector review asks it of a
+  // tool that saves a file (T-476 proposal §2).
+  "add-attachment": { ...ADD, destructiveHint: true },
   "manage-types": CHANGE, // rename, merge, delete, prune, migrate
   "update-tag": CHANGE,
   "rename-tag": CHANGE,

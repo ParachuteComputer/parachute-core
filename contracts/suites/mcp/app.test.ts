@@ -8,7 +8,7 @@
 //   2. Not offered: an applet nobody approved; one approved by a key the hub never linked to the person (anyone who
 //      can write the vault can sign an event); one whose code changed after it was approved; one the person took back.
 //   3. GET /api/approval-keys answers the caller's own linked keys, and nothing without a valid token.
-import { beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { hubCli } from "../../harness/services.ts";
 import { nostrKey, signEvent } from "../compat/_lib.ts";
@@ -24,6 +24,7 @@ const sha = (x: string) => createHash("sha256").update(x, "utf8").digest("hex");
 async function putApplet(id: string, code: string) {
   const r = await operator().post("/notes", { path: `Applets/${id}`, content: code, extension: "tsx", tags: ["applet"], metadata: { applet: { contract: 2, id, name: `App ${id}`, glyph: "◇", access: [{ vault: "here", allow: [{ path: "Notes/", verbs: ["read"] }] }], screens: [{ id: "home", name: id }] } } });
   must(r.status === 201, `setup: applet ${id}: ${r.status} ${JSON.stringify(r.body).slice(0, 200)}`);
+  made.push((r.body as { id: string }).id);
   return r.body as { id: string };
 }
 /** The approval the app's native signer writes (approve.rs), into `Parachute/Approvals/<host>/<vault>/<record>`. */
@@ -34,10 +35,17 @@ async function approve(key: { secret: string; pubkey: string }, record: string, 
   const ev = signEvent(key, { kind: 30479, created_at: n, tags: [["d", `${subject.hub}|${subject.vault}|${record}`]], content: JSON.stringify(content) });
   const r = await operator().post("/notes", { path: `Parachute/Approvals/${new URL(s.hub).host}/${s.vaultName}/${record}-${ev.id.slice(0, 8)}`, content: "", tags: ["parachute-approval"], metadata: { approval: ev } });
   must(r.status === 201, `setup: approval: ${r.status}`);
+  made.push((r.body as { id: string }).id);
 }
 
 const ids = { ok: `ok${tag}`, none: `none${tag}`, strange: `strange${tag}`, changed: `changed${tag}`, back: `back${tag}` };
 let reader: Awaited<ReturnType<typeof mcp>>;
+/** What this file wrote: removed after, so the vault the other suites share lists no applet tools of ours. */
+const made: string[] = [];
+afterAll(async () => {
+  await reader?.close();
+  for (const id of made) await operator().del(`/notes/${id}`).catch(() => {});
+});
 
 beforeAll(async () => {
   await hubCli(s, ["auth", "link-pubkey", "--user", s.admin.username, person.pubkey]);

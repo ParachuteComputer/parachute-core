@@ -188,7 +188,9 @@ on it unchanged (46 pass, 0 fail, on the tarball and the npm install). What chan
   names go at 1.0, and each use is counted in the home's `run/deprecations.json` meanwhile (not on an embedded
   home). Add the record names and `attachment-url` when you move, and `manage-types` and `manage-keys` to the
   admin-only list (`lib.mjs:19`) so that check still covers them. A write key's `tools/list` holds 17 entries, 9
-  tools and 8 aliases, in about 11k characters; on 0.8 the same key sees 11 tools in about 61k.
+  tools and 8 aliases, in about 11k characters; on 0.8 the same key sees 11 tools in about 61k. Since T-476 a write
+  or admin key also sees `add-attachment`, which stores a small file sent in the call (0.8 has it too); add it to an
+  allowlist if a Prism agent should store files.
 - **Types and tags.** A tag with fields or parents is a type. Notes gain `types` (the types among their tags) next
   to `tags`, over REST and MCP; `tags` still lists every name. `tags: [...]` writes and `tag:` queries work as today.
 - **REST, from 0.9.1: `/api/records`.** The `/api/notes` routes under their record name, in the record tools' words

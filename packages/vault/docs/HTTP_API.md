@@ -68,8 +68,7 @@ That's the whole happy path. Everything else in this doc is detail.
   parse the same query/write params. The table below is the lag list: a
   param is "honored" only when that door's parser reads it. A cloud client
   following this doc without checking the table will hit a silent drop or a
-  400. Precedent for door qualification is the "Wave 1, bun-only" line on
-  attachment tickets below. **Every cloud parity PR that lands or removes a
+  400. **Every cloud parity PR that lands or removes a
   param from this list updates this table.**
 
 Version history is the first self-hosted-first feature tracked in this table.
@@ -2912,10 +2911,10 @@ an owning note exists but falls outside the token's scope. The same `404`
 either way keeps the endpoint from acting as an existence oracle. Unscoped
 tokens keep the path-only behavior.
 
-### Attachment tickets (vault#611 — Wave 1, bun-only)
+### Attachment tickets (vault#611; both doors)
 
 MCP tool args are model-emitted, so a base64 upload through a tool call is
-effectively impossible past a few hundred KB. The `request-attachment-upload`
+small (`add-attachment`, below, takes up to 80 KiB). The `request-attachment-upload`
 / `request-attachment-download` MCP tools (`core/src/mcp.ts`) mint a
 short-lived, single-use, capability-in-URL ticket instead of moving bytes
 through the tool call itself — a runtime's shell spends the ticket directly
@@ -2959,12 +2958,96 @@ attachment's raw bytes with its stored `Content-Type`
 between mint and spend, or if its bytes are missing on disk
 (`error_type: "attachment_binary_missing"`).
 
-**Cloud parity.** Bun always wires the ticket provider — a process-wide (not
+**Both doors.** Bun always wires the ticket provider — a process-wide (not
 per-vault) in-memory store, since the 256-bit ticket id is already globally
-unguessable. Cloud's Durable-Object-backed mirror is a separate PR that
-hasn't landed yet; until it does, `request-attachment-upload` /
-`request-attachment-download` are simply absent from cloud's MCP tool list
-(D10 — an agent is never shown an affordance the runtime can't back).
+unguessable. Cloud keeps tickets in the vault's Durable Object (since
+[cloud#177](https://github.com/ParachuteComputer/parachute-cloud/pull/177)),
+so they outlive a restart, and stores the bytes in R2. The spend routes are
+the same, with one difference: cloud refuses an upload without a
+`Content-Length` (`411 length_required`). The tool names differ by surface:
+bun's 0.9 tool list folds both into `attachment-url {action: "upload" |
+"download"}` (the old names stay as deprecated aliases); the hosted door
+lists `request-attachment-upload` / `request-attachment-download`.
+
+**The ticket URL names the host the MCP client connected to**:
+`X-Forwarded-Host`, else the request's own origin, on both doors (bun, when
+the tools are built without a request, uses the configured hub origin). On
+the hosted door that is
+`https://my.parachute.computer/vault/{name}/tickets/{id}`. Spending it needs
+a runtime that can reach that host. Sandboxed runtimes often can't:
+
+- **Claude's code sandbox** (claude.ai and the Claude desktop app) reaches
+  only an allow-list of package registries, `github.com` and two Anthropic
+  hosts, unless the organization allows more. On Team and Enterprise plans an
+  owner can add the host of the vault's connector URL under *Organization
+  settings > Capabilities > Allow network egress to package managers and
+  specific domains* (on the hosted door, `my.parachute.computer`); Anthropic's
+  article names no per-domain setting for Free, Pro and Max. The MCP call
+  itself still works, because Claude makes connector calls from Anthropic's
+  servers, outside the sandbox; only the PUT or GET is refused.
+- **The API code-execution tool** has no internet access, so its sandbox
+  can't spend a ticket at all.
+
+In those runtimes, `add-attachment` (below) stores a small file through the
+MCP call itself, `read-attachment` reads text and images into the
+conversation, and text can be written as a record (`create-note`, or
+`create-record` on bun's 0.9 list). See Anthropic's
+[network settings for file creation](https://support.claude.com/en/articles/12111783-create-and-edit-files-with-claude).
+
+### A file in the call: `add-attachment` (T-476)
+
+`add-attachment {record, file, transcribe?}` (MCP, `vault:write`) stores a
+file whose bytes ride in the tool call, so it works wherever the MCP call
+does, sandbox or not. `file` is the FileInput object of MCP's file-transfer
+extension (`io.modelcontextprotocol/files`, draft):
+
+```json
+{ "id": "f1", "name": "notes.pdf", "mimeType": "application/pdf", "size": 18213,
+  "digest": { "algorithm": "sha-256", "value": "<base64url, no padding; hex also taken>" },
+  "data": "<RFC 4648 base64; line breaks ignored>" }
+```
+
+- Checked before anything is stored: `size` must be the decoded length
+  (`size_mismatch`), the SHA-256 must match `digest` (`digest_mismatch`: the
+  base64 was copied wrong), and the file must be at most 80 KiB
+  (`inline_too_large`, refused on the declared size and on the base64's length
+  before decoding, and on the decoded length; its hint names `attachment-url`). A file without `data`,
+  an empty file, a record that isn't there or is outside a tag scope
+  (`not_found`, `field: "record"`) and active content (`.html`, `.svg`,
+  `.js` … by name, `text/html` and the like by type:
+  `blocked_upload_extension`) are refused too. With no `name` the file is
+  stored as `file` plus its type's extension; `id` is only a label.
+- Then it is stored by the same writer as a spent upload ticket (bun:
+  `storeTicketUpload` in `src/attachment-tickets.ts`), with the same
+  transcription decision. Returns
+  `{attachment: {id, path, mime_type, size}, record}`.
+- **The cap is measured, not guessed.** A model fills `data` by typing the
+  base64, at about one output token per character. On 2026-11-24 Claude Opus
+  5.5 retyped 16, 24, 32, 40, 56 and 80 KiB of random bytes into one tool
+  argument, every byte right (SHA-256 checked); the climb stopped at 80 KiB,
+  the cap. A bigger file goes through `attachment-url` from a runtime that
+  can reach the ticket host.
+- **`x-mcp-file`.** The `file` schema carries the extension's marker,
+  `{"x-mcp-file": {"maxSize": 81920}}`, only for a `tools/list` request whose
+  `_meta` declares the extension
+  (`io.modelcontextprotocol/clientCapabilities.extensions["io.modelcontextprotocol/files"]`).
+  Other clients get the same object unmarked, which an AI can fill itself: the
+  spec asks a host not to show a marked schema to a model that types its
+  arguments. No out-of-band upload yet (the extension's `upload`); a host
+  that transfers files itself sends them inline.
+- `digest` is required here, though the extension makes it optional: the
+  spec lets a tool that needs it require it, and a model copying base64 by
+  hand needs the check. A model types about 4 KiB a minute, so an 80 KiB
+  file is a call of about 20 minutes; with network, `attachment-url` is
+  faster for anything but a small file.
+- Refusals take every tool's shape (MCP refusals, above): a tool result with
+  `isError: true` and `structuredContent {error_type, message, ...}`
+  (`digest_mismatch`, `size_mismatch`, `inline_too_large`, ...), as the
+  extension asks for a failed size, digest or quota check.
+- The account door (`/account/mcp`) doesn't list it, so an AI stores a file
+  through the vault it is connected to (the writer's tool list there keeps
+  the 4,000-token budget). A call naming it there still reaches the vault,
+  which checks the write verb as always.
 
 ### MCP
 
@@ -2981,12 +3064,16 @@ enforced inside the MCP layer; the same `vault:read` / `vault:write` /
 | Verb | Tools |
 |---|---|
 | `read` | `query-notes`, `list-tags`, `find-path`, `vault-info` (get/stats), `doctor`, `request-attachment-download`¹ |
-| `write` (additive over read) | `create-note`, `update-note`, `delete-note`, `request-attachment-upload`¹ |
+| `write` (additive over read) | `create-note`, `update-note`, `delete-note`, `request-attachment-upload`¹, `add-attachment`² |
 | `admin` (additive over write) | `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`, `manage-token`, `vault-info` (description update) |
 
 ¹ Conditionally appended (vault#611) — present only when the door wires an
-attachment-ticket provider. Always true on bun's server. See "Attachment
-tickets" below.
+attachment-ticket provider. Always true on bun's server and on cloud. See
+"Attachment tickets" above.
+
+² Present when the door wires the ticket seam's `storeUpload` (T-476): bun's
+server now, a cloud-style door once its engine pin carries it. See "A file in
+the call" above.
 
 **BREAKING (this release):** `update-tag`/`delete-tag`/`rename-tag`/`merge-tags`
 moved `write` → `admin` (schema/taxonomy curation is a distinct tier from

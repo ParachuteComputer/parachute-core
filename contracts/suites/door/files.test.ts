@@ -2,7 +2,7 @@
 // same with a ticket it can hand to a shell. Bytes are compared exactly.
 import { describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { door, enc, fp, mcp, mediaType, refusal, rest, runId, safeFetch, shape, token, vaultUrl } from "./_door.ts";
+import { door, enc, fp, lacks, mcp, mediaType, refusal, rest, runId, safeFetch, shape, token, vaultUrl } from "./_door.ts";
 
 const api = rest("write");
 const reader = rest("read");
@@ -128,6 +128,66 @@ describe("files", () => {
       const got = await safeFetch(durl);
       expect(got.status).toBe(200);
       expect(sha256(new Uint8Array(await got.arrayBuffer()))).toBe(sha256(bytes));
+    } finally {
+      await c.close();
+    }
+  });
+
+  // T-476: an AI whose runtime can't reach the ticket URL (Claude's code sandbox) sends a small file in the call
+  // itself, as the MCP file-transfer extension's FileInput. The bytes are checked against their size and SHA-256
+  // before anything is stored, so a file copied wrong never lands.
+  test.skipIf(lacks("add-attachment"))("an AI stores a small file in the call: checked, then the same bytes come back", async () => {
+    const c = await mcp("write");
+    try {
+      const tools = await c.tools();
+      const tool: any = tools.find((t) => t.name === "add-attachment");
+      expect(tool, tools.map((t) => t.name).join(",")).toBeTruthy();
+      expect(tool.inputSchema.required).toEqual(["record", "file"]);
+      // A client that didn't declare the extension sees a FileInput it can fill itself, unmarked.
+      expect(tool.inputSchema.properties.file["x-mcp-file"]).toBeUndefined();
+      fp("files/add-attachment.schema", tool.inputSchema);
+      fp("files/add-attachment.annotations", tool.annotations ?? null);
+      expect((await mcp("read").then(async (r) => { try { return (await r.tools()).map((t) => t.name); } finally { await r.close(); } }))).not.toContain("add-attachment");
+
+      const bytes = png();
+      const digest = { algorithm: "sha-256", value: createHash("sha256").update(bytes).digest("base64url") };
+      const file = { id: "f1", name: "inline.png", mimeType: "image/png", size: bytes.length, digest, data: Buffer.from(bytes).toString("base64") };
+      const note = await api.post("/notes", { content: "a file in the call", path: `${runId("files")}/inline` });
+      const raw = async (args: Record<string, unknown>) => {
+        const r: any = await c.client.callTool({ name: "add-attachment", arguments: args }).catch((e: any) => ({ thrown: { code: e.code, message: String(e.message), data: e.data ?? null } }));
+        return r;
+      };
+      // one way to refuse: an isError result, its error_type and field in structuredContent (a JSON-RPC error would show as thrown)
+      const refused = (r: any) => (r.thrown ? { code: r.thrown.code, type: r.thrown.data?.error_type ?? null, field: r.thrown.data?.field ?? null } : { isError: r.isError ?? false, type: r.structuredContent?.error_type ?? null, field: r.structuredContent?.field ?? null });
+
+      // Copied wrong (one base64 character), the wrong size, over the cap, a record that isn't there: refused.
+      const typo = file.data.slice(0, 50) + (file.data[50] === "A" ? "B" : "A") + file.data.slice(51);
+      const wrong = await raw({ record: note.body.id, file: { ...file, data: typo } });
+      fp("files/add-attachment.refusal.digest", refused(wrong));
+      expect(JSON.stringify(wrong)).toContain("digest_mismatch");
+      const short = await raw({ record: note.body.id, file: { ...file, size: bytes.length + 1 } });
+      fp("files/add-attachment.refusal.size", refused(short));
+      expect(JSON.stringify(short)).toContain("size_mismatch");
+      const big = new Uint8Array(randomBytes(1024 * 1024));
+      const over = await raw({ record: note.body.id, file: { ...file, size: big.length, data: Buffer.from(big).toString("base64") } });
+      fp("files/add-attachment.refusal.too-large", refused(over));
+      expect(JSON.stringify(over)).toContain("inline_too_large");
+      const nowhere = await raw({ record: `${runId("files")}/no-such-record`, file });
+      fp("files/add-attachment.refusal.no-record", refused(nowhere));
+      expect(JSON.stringify(nowhere)).toContain("not_found");
+      const listedBefore = await reader.get(`/notes/${note.body.id}/attachments`);
+      expect((Array.isArray(listedBefore.body) ? listedBefore.body : listedBefore.body.attachments).length).toBe(0);
+
+      const stored = await c.call("add-attachment", { record: note.body.id, file });
+      fp("files/add-attachment.result.shape", shape(stored));
+      expect(stored.record).toBe(note.body.id);
+      expect(stored.attachment.size).toBe(bytes.length);
+      const listed = await reader.get(`/notes/${note.body.id}/attachments`);
+      expect((Array.isArray(listed.body) ? listed.body : listed.body.attachments).map((a: any) => a.id)).toEqual([stored.attachment.id]);
+      const seen: any = await c.client.callTool({ name: "read-attachment", arguments: { attachment_id: stored.attachment.id } });
+      const image = (seen.content ?? []).find((b: any) => b.type === "image");
+      expect(image?.mimeType).toBe("image/png");
+      expect(sha256(new Uint8Array(Buffer.from(image.data, "base64")))).toBe(sha256(bytes));
     } finally {
       await c.close();
     }

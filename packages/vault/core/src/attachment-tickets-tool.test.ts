@@ -5,7 +5,8 @@
  * when unwired" contract (D10) and the mint-time policy (note/attachment
  * resolution, tag-scope, size cap, extension blocklist) against a fake
  * in-memory `AttachmentTicketProvider` — the spend side (actually writing
- * bytes) is bun-only and covered in src/attachment-tickets.test.ts.
+ * bytes) belongs to each door: bun's is covered in src/attachment-tickets.test.ts,
+ * cloud's in its own suite.
  */
 
 import { describe, test, expect, beforeEach } from "bun:test";

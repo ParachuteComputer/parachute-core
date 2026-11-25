@@ -537,7 +537,7 @@ manage-types {
 
 Then \`create-record { path: "Meetings/Kickoff", types: ["meeting"], fields: {
 held_on: "2026-01-12" } }\`, and \`update-record { id, fields: { status: "done" },
-if_updated_at: "<the updated_at you read>" }\` to change one value (\`fields\` merges;
+if_updated_at: "<its updatedAt as you read it>" }\` to change one value (\`fields\` merges;
 \`null\` removes a key).
 
 A later \`manage-types\` call **merges** \`fields\` (new keys added). With write

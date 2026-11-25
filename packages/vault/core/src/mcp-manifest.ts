@@ -3,6 +3,7 @@ import { HYBRID_TEXT } from "./hybrid.js";
 import { MIN_CONTENT_LENGTH } from "./content-range-constants.js";
 import { MAX_TICKET_UPLOAD_BYTES } from "./attachment/tickets.js";
 import { SHORT_TOOLS } from "./mcp-short.js";
+import { FILE_INPUT, MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.js";
 
 /**
  * Pure-data MCP tool manifest — the single source of truth for every core MCP
@@ -31,11 +32,12 @@ export type McpToolVerb = "read" | "write" | "admin";
 /**
  * Inclusion gate for a tool. `core` tools are always present;
  * `attachment-tickets` requires the caller wire an `attachmentTickets` seam;
- * `attachment-bytes` requires an `attachmentBytes` seam (see
+ * `attachment-bytes` requires an `attachmentBytes` seam; `attachment-store`
+ * requires the ticket seam's `storeUpload` (see
  * `GenerateMcpToolsOpts`). A front-of-house layer reads this to know which
  * tools a given runtime can actually back.
  */
-export type McpToolCondition = "core" | "attachment-tickets" | "attachment-bytes";
+export type McpToolCondition = "core" | "attachment-tickets" | "attachment-bytes" | "attachment-store";
 
 /** One pure-data tool entry. Mirrors the metadata half of `McpToolDef` (no `execute`/`resultContent`). */
 export interface McpToolManifestEntry {
@@ -378,7 +380,7 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
 - \`links: { add: [{ target, relationship }], remove: [{ target, relationship }] }\` — add/remove links
 - When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
 - For batch: pass a \`notes\` array, each with an \`id\` field.
-- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`force\` only waives the *requirement to supply* \`if_updated_at\` — if you pass both, the precondition you supplied still applies and a mismatch returns a conflict error. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design). **Batch default (vault#554):** a top-level \`force\` and/or \`if_updated_at\` alongside a \`notes\` array applies as the DEFAULT for every item that doesn't set its own — e.g. \`{force: true, notes: [{id: "a", content: "..."}, {id: "b", content: "...", if_updated_at: "..."}]}\` forces item "a" but still enforces the precondition on item "b" (its own \`if_updated_at\` wins). Per-item values always take precedence over the top-level default.
+- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the note's \`updatedAt\` as you last read it — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`force\` only waives the *requirement to supply* \`if_updated_at\` — if you pass both, the precondition you supplied still applies and a mismatch returns a conflict error. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design). **Batch default (vault#554):** a top-level \`force\` and/or \`if_updated_at\` alongside a \`notes\` array applies as the DEFAULT for every item that doesn't set its own — e.g. \`{force: true, notes: [{id: "a", content: "..."}, {id: "b", content: "...", if_updated_at: "..."}]}\` forces item "a" but still enforces the precondition on item "b" (its own \`if_updated_at\` wins). Per-item values always take precedence over the top-level default.
 - **Idempotent upsert via \`if_missing: "create"\`** — when the note doesn't exist, create it from this same payload (content/path/tags/metadata become the create fields; OC precondition skipped — nothing to conflict with). Response carries \`created: true\`. Useful for nightly sync loops that don't know ahead of time whether the note exists. Default \`"fail"\` (current behavior — missing note errors). See vault#309.
 - \`include_content\` (default \`true\`) — set \`false\` to receive a lean index shape (\`id\`, \`path\`, \`createdAt\`, \`updatedAt\`, \`createdBy\`, \`createdVia\`, \`lastUpdatedBy\`, \`lastUpdatedVia\`, \`tags\`, \`metadata\`, \`byteSize\`, \`preview\`, \`displayTitle\`) instead of full content. Useful for agents making frequent small edits to large notes (e.g. via \`append\` or \`content_edit\`) where re-receiving the body is the dominant cost. \`validation_status\` is preserved on the lean shape when present. \`displayTitle\` is the note's first non-empty content line (heading markers stripped, ~120 chars max), \`null\` when content is empty — never stored, computed fresh from content already in hand.
 
@@ -403,7 +405,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           extension: { type: "string", description: "Change the note's file extension (vault#328). Allowed but caller-owned — you're responsible for content validity if you switch a non-empty note's extension. Lowercase alphanumeric, 1–16 chars; \"parachute\" prefix reserved." },
           metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale). A value of `null` deletes that key (RFC 7386 merge-patch) — e.g. `{\"new_key\": \"v\", \"old_key\": null}` renames in one call. Omitting a key preserves its existing value." },
           created_at: { type: "string", description: "New created_at timestamp" },
-          if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set or the call is `append`/`prepend`-only." },
+          if_updated_at: { type: "string", description: "Optimistic concurrency check: the note's `updatedAt` as you last read it. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set or the call is `append`/`prepend`-only." },
           force: { type: "boolean", description: "Waive the *requirement to supply* `if_updated_at` and run the update unconditionally. Use only for bulk migrations or scripted writes where concurrency is known-safe. Note: this does not override an `if_updated_at` you actually pass — if you supply both, the precondition still applies and a mismatch returns a conflict error." },
           if_missing: { type: "string", enum: ["fail", "create"], description: "What to do when the note (by `id`/path) doesn't exist. `\"fail\"` (default) — error, current behavior. `\"create\"` — create the note from this same payload (content/path/tags/metadata become the create fields; the response carries `created: true`). Skips the `if_updated_at` precondition on the create branch (nothing to conflict with). Idempotent for sync loops that don't know ahead of time whether the note exists. See vault#309." },
           state_transition: {
@@ -797,6 +799,21 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         required: ["attachment_id"],
       },
       condition: "attachment-tickets",
+    },
+    {
+      name: "add-attachment",
+      requiredVerb: "write",
+      description: `Store a file on a record, its bytes in this call (T-476): for an agent that holds the file but whose runtime can't reach this vault's URL, such as a code sandbox. \`file\` is the FileInput object of MCP's file-transfer extension (io.modelcontextprotocol/files): \`id\` (any label), \`name\` (the file's name; its extension sets the stored type, and active content such as .html/.svg/.js is refused), \`mimeType\`, \`size\` (the exact decoded byte count), \`digest\` ({algorithm: "sha-256", value}: the SHA-256 of the bytes in base64url without padding, as the extension says, or in hex) and \`data\` (the bytes in RFC 4648 base64; line breaks are ignored). The size and the SHA-256 are checked before anything is stored: a mismatch is refused (\`size_mismatch\`, \`digest_mismatch\`), so a file copied wrong never lands. The limit is ${MAX_INLINE_ATTACHMENT_BYTES} bytes (${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB, what a model can type into one call); a bigger file is refused (\`inline_too_large\`): use attachment-url {action: "upload"} and PUT the bytes to its URL instead, which takes up to 100 MiB if your runtime can reach this host. Stored exactly as an upload ticket stores it; \`transcribe: true\` transcribes an audio file. Returns {attachment: {id, path, mime_type, size}, record}.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          record: { type: "string", description: "The record's id or path" },
+          file: FILE_INPUT,
+          transcribe: { type: "boolean", description: "Transcribe an audio file, as attachment-url's upload does" },
+        },
+        required: ["record", "file"],
+      },
+      condition: "attachment-store",
     },
     {
       name: "read-attachment",
