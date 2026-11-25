@@ -361,6 +361,28 @@
       "why": "Only an admin key adds or changes a skill (a record of type `skill`, instructions every connected AI may follow). The rule is in the engine's pre-write gate, fail closed: a door that doesn't say who may write skills refuses everyone. A cloud-style door on an older engine pin has no rule yet."
     },
     {
+      "id": "skills-extension",
+      "keys": [
+        "has/skills-extension",
+        "skills/ext.*"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "lacks": [
+        "cloud",
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud door/0.9 (T-476): skills/list, skills/get, resources/list and resources/read on its 2026-07-28 handler, from core skill-files.ts",
+      "why": "On a 2026-07-28 connection a box serves the MCP Skills extension: vault-guide, live-page and the vault's own skill records. Cloud's door speaks 2026-07-28 (its own handler) but has no skills methods yet. Every door's instructions still name the vault's skills, and query-records reads them, so a client reaches them either way."
+    },
+    {
       "id": "share-a-vault",
       "keys": [
         "has/share-a-vault"
