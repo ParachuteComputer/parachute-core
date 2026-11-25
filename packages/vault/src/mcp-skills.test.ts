@@ -135,6 +135,15 @@ describe("skills over MCP (T-476)", () => {
     expect(voiceRead.result.contents[0].text).toBe(VOICE.body);
   });
 
+  test("a read key on the 2026-07-28 door sees only the read tools, and a write is refused", async () => {
+    const read: AuthResult = { ...auth(), scopes: [`vault:${V}:read`] };
+    const names = (await modern("tools/list", {}, read)).result.tools.map((t: any) => t.name);
+    expect(names).toContain("query-records");
+    expect(names).not.toContain("create-record");
+    const made = await modern("tools/call", { name: "create-record", arguments: { path: "X/y", body: "no" } }, read);
+    expect(made.result?.isError === true || made.error !== undefined).toBe(true);
+  });
+
   test("a 2025 request is the door as before: no skills extension, the same tools", async () => {
     await seed([BRAND]);
     const init = await legacy("initialize", {
