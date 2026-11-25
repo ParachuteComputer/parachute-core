@@ -548,21 +548,26 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
       const raw = params?.topic;
       if (raw === undefined || raw === null || raw === "") {
         const index = await read("/llms.txt");
-        if (typeof index === "string") return { index: `${origin}/llms.txt`, pages: `${origin}/docs/`, markdown: index };
+        // the site's list, when it names docs pages (an older site's llms.txt may name none)
+        if (typeof index === "string" && pagesOfLlmsTxt(index).length > 0) return { index: `${origin}/llms.txt`, pages: `${origin}/docs/`, markdown: index };
         const offline = Object.entries(OFFLINE_PAGES).map(([t, p]) => `- \`${t}\`: ${p.title}. ${p.summary}`).join("\n");
-        return { index: `${origin}/llms.txt`, pages: `${origin}/docs/`, markdown: offline, note: offlineNote(`${origin}/llms.txt`, unreachable(index) ? index.unreachable : "not there") };
+        const why = unreachable(index) ? offlineNote(`${origin}/llms.txt`, index.unreachable) : `${origin}/llms.txt names no docs pages; these are the ones built into Parachute${opts.version ? ` ${opts.version}` : ""}.`;
+        return { index: `${origin}/llms.txt`, pages: `${origin}/docs/`, markdown: offline, note: why };
       }
       const { topic, anchor, minor: asked } = topicOf(String(raw), origin);
       if (!TOPIC_RE.test(topic) || (anchor !== null && !ANCHOR_RE.test(anchor))) {
         refuse(`"${String(raw).slice(0, 80)}" isn't a page name.`, "invalid_topic", 'a name from docs {} or docs {search}, e.g. "fix/needs-admin"');
       }
       const got = await page(topic, asked ?? minor);
-      if (got === null) refuse(`No page "${topic}".`, "unknown_topic", "docs {search: \"<words>\"} finds a page; docs {} lists them");
-      if (unreachable(got)) {
+      if (got === null || unreachable(got)) {
+        // The copy built in: when the site can't be read, and when it has no such page (yet: a site older than this
+        // version, or a self-hoster's copy without the fix pages).
         const kept = OFFLINE_PAGES[topic];
         const url = docsPageUrl({ origin, version: opts.version }, topic);
-        if (!kept) refuse(`The docs at ${url} couldn't be read (${got.unreachable}).`, "docs_unreachable", `open ${url} yourself, or try again`);
-        return { topic, page: url, markdown: `# ${kept.title}\n\n${kept.body ?? kept.summary}`, note: offlineNote(url, got.unreachable) };
+        if (!kept && got === null) refuse(`No page "${topic}".`, "unknown_topic", "docs {search: \"<words>\"} finds a page; docs {} lists them");
+        if (!kept) refuse(`The docs at ${url} couldn't be read (${(got as { unreachable: string }).unreachable}).`, "docs_unreachable", `open ${url} yourself, or try again`);
+        const note = got === null ? `The site has no page at ${url}; this is the copy built into Parachute${opts.version ? ` ${opts.version}` : ""}.` : offlineNote(url, got.unreachable);
+        return { topic, page: url, markdown: `# ${kept.title}\n\n${kept.body ?? kept.summary}`, note };
       }
       const part = anchor ? section(got.markdown, anchor) : null;
       return { topic, page: `${got.url}${anchor ? `#${anchor}` : ""}`, markdown: part ?? got.markdown, ...(got.note ? { note: got.note } : {}) };

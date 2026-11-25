@@ -162,6 +162,18 @@ describe("when the site is down", () => {
     expect(((await tool.execute({ search: "needs admin" })) as { markdown: string }).markdown).toStartWith("- `fix/needs-admin`");
   });
 
+  test("a site that has no fix pages yet (404): the built-in copy, said so; an older site's list naming no docs pages: the built-in list", async () => {
+    const old = site({ "/llms.txt": "# Parachute\n\n- [Vault](https://parachute.computer/vault/): the old picture\n" });
+    const tool = buildDocsTool({ origin: "https://docs.example", version: "0.9.0-pre.2", fetch: old.f, cache: new Map() });
+    const r = (await tool.execute({ topic: "fix/unknown-type" })) as { markdown: string; note: string };
+    expect(r.markdown).toStartWith("# A type that isn't there");
+    expect(r.note).toBe("The site has no page at https://docs.example/docs/v/0.9/fix/unknown-type/; this is the copy built into Parachute 0.9.0-pre.2.");
+    const list = (await tool.execute({})) as { markdown: string; note: string };
+    expect(list.markdown).toContain("- `fix/unknown-type`");
+    expect(list.note).toBe("https://docs.example/llms.txt names no docs pages; these are the ones built into Parachute 0.9.0-pre.2.");
+    await expect(tool.execute({ topic: "build/nothing" })).rejects.toMatchObject({ error_type: "unknown_topic" });
+  });
+
   test("a 5xx is the site down, not a missing page: the offline copy, never 'no page'", async () => {
     const tool = buildDocsTool({ origin: "https://docs.example", fetch: (async () => new Response("bad gateway", { status: 502 })) as unknown as typeof fetch, cache: new Map() });
     expect(((await tool.execute({ topic: "fix/conflict" })) as { note: string }).note).toContain("(it answered 502)");
