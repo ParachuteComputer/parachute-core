@@ -151,7 +151,7 @@ describe("when the site is down", () => {
     const tool = buildDocsTool({ origin: "https://docs.example", version: "0.9.0-pre.2", fetch: down, cache: new Map() });
     const r = (await tool.execute({ topic: "fix/needs-admin" })) as { markdown: string; note: string; page: string };
     expect(r.markdown).toStartWith("# Needs admin");
-    expect(r.markdown).toContain("tick the level it needs");
+    expect(r.markdown).toContain("leave the level it needs ticked on the Parachute approval page");
     expect(r.note).toBe("Offline copy: https://docs.example/docs/v/0.9/fix/needs-admin/ couldn't be read (getaddrinfo ENOTFOUND).");
     const [block] = tool.resultContent!(r) as { text: string }[];
     expect(block.text).toStartWith("(Offline copy: ");

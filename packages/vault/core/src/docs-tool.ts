@@ -269,7 +269,7 @@ export const OFFLINE_PAGES: Readonly<Record<string, { title: string; summary: st
     summary: "A connection reaches one vault at one level: read, write or admin. A refusal or a missing tool means this one is below what the act needs.",
     body:
       "Every connection reaches a vault at one level. Read sees records; write also creates, changes and deletes them and may define types; admin also manages keys, the vault's description and skills. A tool above a connection's level isn't listed for it.\n\n" +
-      "The fix is the person's, not the AI's: they reconnect this AI and tick the level it needs on the approval page (Parachute Cloud: Settings, then Connected apps), or make a key with that level (`parachute keys new`). Don't try another way round the refusal; tell the person what you were trying and which level it needs.",
+      "The fix is the person's, not the AI's: they connect this AI again (remove it in their AI app and add it back) and leave the level it needs ticked on the Parachute approval page that opens. On their own server they can also make a key with that level: `parachute keys new <name> --vault <vault> --can admin`. Don't try another way round the refusal; tell the person what you were trying and which level it needs.",
   },
   "fix/unknown-type": {
     title: "A type that isn't there",
