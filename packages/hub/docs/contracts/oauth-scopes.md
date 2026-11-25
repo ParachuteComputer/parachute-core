@@ -127,9 +127,12 @@ Canonical implementations:
   ticked admin, Parachute's own app included (anyone can register that name
   on loopback). A silent re-link (same client, or a fresh client of the same
   name) never drops a powerful scope the person granted: when the prior grant
-  holds one the ask doesn't name, the consent page is shown again, and what
-  the person approves there becomes the grant (a powerful scope left unticked
-  leaves it, so the next re-link is silent). Same-hub clients (registered by
+  holds one the ask doesn't name, for a vault the ask names (or the account,
+  for an account ask), the consent page is shown again, and what the person
+  approves there becomes the grant for that vault (a powerful scope left
+  unticked leaves it, so the next re-link is silent). Another vault's admin
+  on the same client is left alone. On one vault, a read/write ask after an
+  app was given admin there shows the page once. Same-hub clients (registered by
   the operator) keep their own auto-approve, which reads only the ask.
   Parachute Cloud lists the same two scopes.
 - **Vault-bound consent drops foreign scopes.** When a client sends an

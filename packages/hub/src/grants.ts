@@ -170,7 +170,21 @@ export function isCoveredByGrant(
  */
 function holdsPowerfulBeyondAsk(grant: Grant, requestedScopes: readonly string[], powerful: (scope: string) => boolean): boolean {
   const asked = new Set(requestedScopes);
-  return grant.scopes.some((scope) => powerful(scope) && !asked.has(scope));
+  return grant.scopes.some((scope) => powerful(scope) && !asked.has(scope) && inReachOfAsk(scope, requestedScopes));
+}
+
+/**
+ * Whether `scope` is about what this ask reaches (T-476 review): a vault scope for a vault the ask names (any vault,
+ * when the ask has an unnamed vault verb the page will bind), an account scope when the ask is for the account. One app
+ * connected to two vaults must not bounce between consent pages over the other vault's admin.
+ */
+export function inReachOfAsk(scope: string, requestedScopes: readonly string[]): boolean {
+  const parts = scope.split(":");
+  if (parts[0] === "account") return requestedScopes.some((r) => r.startsWith("account:"));
+  if (parts[0] !== "vault") return false;
+  const asked = requestedScopes.map((r) => r.split(":")).filter((r) => r[0] === "vault");
+  if (asked.some((r) => r.length === 2)) return true;
+  return parts.length === 2 || asked.some((r) => r.length === 3 && r[1] === parts[1]);
 }
 
 /**

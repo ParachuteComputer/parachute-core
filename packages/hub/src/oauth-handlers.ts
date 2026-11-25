@@ -58,6 +58,7 @@ import {
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import {
   findGrant,
+  inReachOfAsk,
   isCoveredByGrant,
   isCoveredByGrantForClientName,
   recordGrant,
@@ -2227,7 +2228,7 @@ function issueAuthCodeRedirect(
     if (perVaultChoice) applyAccountDoorChoice(db, userId, params.clientId, dedupedScopes, grantNow);
     const replaces = (scope: string) =>
       (perVaultChoice && isAccountDoorChoiceScope(scope)) ||
-      (consented && forcesExplicitConsent(scope) && !dedupedScopes.includes(scope));
+      (consented && forcesExplicitConsent(scope) && !dedupedScopes.includes(scope) && inReachOfAsk(scope, dedupedScopes));
     recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, replaces);
     return issueAuthCode(db, {
       clientId: params.clientId,
