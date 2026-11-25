@@ -3234,7 +3234,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // The stored name is the file's own, or with none a fixed stem and the extension of its media type, so the
         // stored file is served as what it is. Never `file.id`: a label like "x.html" would put a blocked extension on
         // disk. The blocklist runs on the name that is actually stored.
-        const typeExt = Object.entries(ATTACHMENT_MIME_TYPES).find(([, m]) => m === typed)?.[0] ?? "";
+        const typeExt = Object.entries(ATTACHMENT_MIME_TYPES).find(([, m]) => m.split(";")[0]!.trim() === typed)?.[0] ?? "";
         const filename = file.name ?? `file${typeExt}`;
         const ext = sanitizeAttachmentExtension(filename);
         if (BLOCKED_ATTACHMENT_EXTENSIONS.has(ext)) {

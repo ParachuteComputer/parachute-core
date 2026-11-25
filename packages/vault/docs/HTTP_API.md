@@ -3004,7 +3004,7 @@ extension (`io.modelcontextprotocol/files`, draft):
   (`size_mismatch`), the SHA-256 must match `digest` (`digest_mismatch`: the
   base64 was copied wrong), and the file must be at most 80 KiB
   (`inline_too_large`, refused on the declared size and on the base64's length
-  before decoding; its hint names `attachment-url`). A file without `data`,
+  before decoding, and on the decoded length; its hint names `attachment-url`). A file without `data`,
   an empty file, a record that isn't there or is outside a tag scope
   (`not_found`, `field: "record"`) and active content (`.html`, `.svg`,
   `.js` … by name, `text/html` and the like by type:
