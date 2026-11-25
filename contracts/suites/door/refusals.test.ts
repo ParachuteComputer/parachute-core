@@ -126,7 +126,10 @@ describe("one way to refuse", () => {
         ["above-level", await token("read"), "create-record", { path: `${path}-r`, body: "x" }, "unknown_tool"],
       ];
       for (const [label, bearer, name, args, type] of cases) {
-        const modern = oneShape(`modern.${label}`, await modernCall(url, bearer, name, args), type, false);
+        const body = await modernCall(url, bearer, name, args);
+        // the 2026-07-28 codec stamps `resultType` on a result; the 2025 door never does, so this one was reached
+        expect({ label, resultType: body?.result?.resultType }).toEqual({ label, resultType: "complete" });
+        const modern = oneShape(`modern.${label}`, body, type, false);
         // the same refusal the 2025 door says, field for field (the conflict's tokens are the same record's)
         const old = (await call(url, bearer, name, args)).result?.structuredContent;
         expect({ label, modern }).toEqual({ label, modern: old });
