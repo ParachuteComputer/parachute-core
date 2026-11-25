@@ -461,7 +461,8 @@ export async function callVaultModuleTool(
     // A `vault` given is ignored. A vault's own refusal (a page that isn't there) comes back as its isError result and is
     // answered as it is; only a vault that can't be reached (a throw) moves on to the next one.
     const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
-    let last: unknown = Object.assign(new Error("This key covers no vault."), { error_type: "no_vault" });
+    // A refusal, not a crash, when the key covers no vault to answer it (callTool answers AccountToolError as one).
+    let last: unknown = new AccountToolError("no_vault", "This key covers no vault.");
     for (const v of schemaSourceCandidates(ctx, coverage.vaults)) {
       try {
         return await postVaultMcp(ctx, v, verbForVault(ctx, v.name), "tools/call", { name, arguments: stripVaultArg(args) });

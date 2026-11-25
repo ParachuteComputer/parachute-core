@@ -1676,11 +1676,13 @@ export function readGlobalConfig(): GlobalConfig {
         config.auto_transcribe = { enabled: autoTranscribeEnabled };
       }
       // docs block (T-476): `base_url` under `docs:`, 2-space indent, same grammar as auto_transcribe.
+      // `docs: off` on one line is the same as `base_url: off`
+      if (/^docs:\s*(off|false|none|0)\s*(?:#.*)?$/im.test(yaml)) config.docs = { base_url: "off" };
       const docsStart = yaml.match(/^docs:\s*$/m);
       if (docsStart) {
         const after = yaml.slice((docsStart.index ?? 0) + docsStart[0].length);
         for (const line of after.split("\n")) {
-          if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+          if (line.match(/^[^\s#]/)) break; // next top-level key (a comment doesn't end the block)
           const m = line.match(/^\s+base_url:\s*"?([^"\s#]+)"?\s*(?:#.*)?$/);
           if (m) {
             config.docs = { base_url: m[1]! };

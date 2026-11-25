@@ -46,6 +46,8 @@ describe.skipIf(!vault)("account door docs links = vault door docs links", () =>
         "port: 1940\ndocs:\n  base_url: off\n",
         "port: 1940\ndocs:\n\ndiscovery: enabled\n",
         "port: 1940\n",
+        "port: 1940\ndocs: off\n",
+        "port: 1940\ndocs:\n# ours\n  base_url: https://docs.example.org\n",
       ]) {
         writeFileSync(join(home, "vault", "config.yaml"), yaml);
         expect({ yaml, hub: hub.configuredDocsBase(join(home, "vault", "config.yaml")) }).toEqual({ yaml, hub: cfg.readGlobalConfig().docs?.base_url });

@@ -245,6 +245,11 @@ describe("config", () => {
       if (saved === undefined) delete process.env.PARACHUTE_DOCS_URL;
       else process.env.PARACHUTE_DOCS_URL = saved;
     }
+    // `docs: off` on one line, and a comment line inside the block
+    fs.writeFileSync(path, "port: 1940\ndocs: off\n");
+    expect(readGlobalConfig().docs).toEqual({ base_url: "off" });
+    fs.writeFileSync(path, "port: 1940\ndocs:\n# our copy\n  base_url: https://docs.example.org\n");
+    expect(readGlobalConfig().docs).toEqual({ base_url: "https://docs.example.org" });
     writeGlobalConfig({ port: 1940 });
     expect(readGlobalConfig().docs).toBeUndefined();
   });

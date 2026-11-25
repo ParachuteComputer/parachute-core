@@ -114,10 +114,11 @@ export function configuredDocsBase(path = join(CONFIG_DIR, "vault", "config.yaml
   try {
     if (!existsSync(path)) return undefined;
     const yaml = readFileSync(path, "utf-8");
+    if (/^docs:\s*(off|false|none|0)\s*(?:#.*)?$/im.test(yaml)) return "off";
     const start = yaml.match(/^docs:\s*$/m);
     if (!start) return undefined;
     for (const line of yaml.slice((start.index ?? 0) + start[0].length).split("\n")) {
-      if (line.match(/^\S/) && line.trim().length > 0) break;
+      if (line.match(/^[^\s#]/)) break;
       const m = line.match(/^\s+base_url:\s*"?([^"\s#]+)"?\s*(?:#.*)?$/);
       if (m) return m[1]!;
     }

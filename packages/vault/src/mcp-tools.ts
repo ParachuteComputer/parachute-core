@@ -139,10 +139,7 @@ export async function getServerInstruction(
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
     // T-476: the docs for this version; "X is out" from the site's /latest.json as last read (never waited on).
-    docs: (() => {
-      const d = boxDocs();
-      return d.origin === null ? null : { origin: d.origin, version: d.version, newer: newerRelease(d.version, latestRelease(d.origin).value) };
-    })(),
+    docs: docsLine(boxDocs()),
     // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
     ...(auth
       ? {
@@ -177,6 +174,16 @@ export function boxDocs(): DocsContext {
   return docsKept.value;
 }
 let docsKept: { key: string; value: DocsContext } | null = null;
+
+/** The docs tool's options for this box's docs; null: no tool. */
+function toolDocs(d: DocsContext): { origin: string; version: string } | null {
+  return d.origin === null ? null : { origin: d.origin, version: d.version };
+}
+
+/** The brief's docs line for this box's docs, with "X is out" from the site's /latest.json as last read (never awaited). */
+function docsLine(d: DocsContext): { origin: string; version: string; newer: string | null } | null {
+  return d.origin === null ? null : { origin: d.origin, version: d.version, newer: newerRelease(d.version, latestRelease(d.origin).value) };
+}
 
 /**
  * The vault's projection as this key may see it: filtered to `scoped_tags` with counts scope-aware (vault#766, T-419).
@@ -433,10 +440,7 @@ export function generateScopedMcpTools(
         }
       : {}),
     doorTool: (name) => (name === "manage-token" || name === "manage-keys" ? { ...manageTokenReference(vaultName), name } : undefined),
-    docs: (() => {
-      const d = boxDocs();
-      return d.origin === null ? null : { origin: d.origin, version: d.version };
-    })(),
+    docs: toolDocs(boxDocs()),
   });
   applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 

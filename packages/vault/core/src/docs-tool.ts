@@ -39,6 +39,7 @@ interface DocsToolDef {
 export const DOCS_ORIGIN = "https://parachute.computer";
 const TTL_MS = 60 * 60 * 1000;
 const LATEST_TTL_MS = 6 * 60 * 60 * 1000;
+const LATEST_RETRY_MS = 10 * 60 * 1000;
 const MAX_PAGES = 64;
 const MAX_BYTES = 200 * 1024;
 const TIMEOUT_MS = 8000;
@@ -87,6 +88,14 @@ export function docsMinor(version: string | undefined): string | null {
 }
 
 const trimOrigin = (o: string) => o.trim().replace(/\/+$/, "");
+/** Whether two addresses are on the same host (any scheme): where a docs read may be redirected. */
+const sameHost = (a: string, b: string): boolean => {
+  try {
+    return new URL(a).hostname === new URL(b).hostname;
+  } catch {
+    return false;
+  }
+};
 
 /** The address a person opens for a page (and the docs tool takes as a topic): this version's when the version is known. */
 export function docsPageUrl(ctx: { origin: string; version?: string }, topic: string): string {
@@ -220,19 +229,22 @@ export function latestRelease(origin: string, opts: { fetch?: typeof fetch; now?
   LATEST.set(key, entry); // before the read starts, so a read that fails at once still leaves this entry settled
   const refresh = (async () => {
     try {
-      const res = await get(`${key}/latest.json`, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "application/json" } });
+      const res = await get(`${key}/latest.json`, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "application/json" } });
+      if (res.redirected && !sameHost(res.url, key)) throw new Error("latest.json redirected off the docs host");
       if (!res.ok) {
         res.body?.cancel().catch(() => {});
-        return;
+        throw new Error(`latest.json answered ${res.status}`);
       }
       const { bytes } = await readCapped(res, 16 * 1024);
       const j = JSON.parse(new TextDecoder().decode(bytes)) as { core?: { latest?: unknown; beta?: unknown } };
       const pick = (v: unknown) => (typeof v === "string" && docsMinor(v) ? v : undefined);
       entry.value = { latest: pick(j?.core?.latest), beta: pick(j?.core?.beta) };
-    } catch {
-      // unreachable or not JSON: keep what we had, and try again after the same wait
-    } finally {
       entry.at = now();
+    } catch {
+      // unreachable or not JSON: keep what we had, and try again in ten minutes (a box that started before its
+      // network, or one blip, shouldn't hide "X is out" for six hours)
+      entry.at = now() - LATEST_TTL_MS + LATEST_RETRY_MS;
+    } finally {
       if (entry.pending === mark) entry.pending = null;
     }
   })();
@@ -433,7 +445,7 @@ function section(markdown: string, anchor: string): string | null {
   for (let i = 0; i < lines.length; i++) {
     if (/^\s*(```|~~~)/.test(lines[i]!)) fence = !fence;
     if (fence) continue;
-    const h = /^(#{1,6})\s+(.*?)\s*(?:\{#([a-z0-9-]+)\})?\s*$/.exec(lines[i]!);
+    const h = /^(#{1,6})\s+(.*?)\s*(?:\{#([a-z0-9_-]+)\})?\s*$/.exec(lines[i]!);
     if (!h) continue;
     if (start >= 0 && h[1]!.length <= level) return lines.slice(start, i).join("\n").trimEnd();
     if (start < 0 && (h[3] === anchor || slug(h[2]!) === anchor)) {
@@ -509,7 +521,13 @@ export function buildDocsTool(opts: DocsToolOpts = {}): DocsToolDef {
     }
     let text: string | null;
     try {
-      const res = await get(key, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "text/markdown, text/plain, application/json" } });
+      const res = await get(key, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "text/markdown, text/plain, application/json" } });
+      // A redirect is followed only on the docs' own host (http to https, a trailing slash): one that leaves it is the
+      // site down, never a page from somewhere else.
+      if (res.redirected && !sameHost(res.url, key)) {
+        res.body?.cancel().catch(() => {});
+        return hit?.text != null ? hit.text : { unreachable: "it redirected off the docs host" };
+      }
       if (!res.ok) {
         res.body?.cancel().catch(() => {}); // a 404 or an error page: nothing of it is read
         if (res.status !== 404) return hit?.text != null ? hit.text : { unreachable: `it answered ${res.status}` };

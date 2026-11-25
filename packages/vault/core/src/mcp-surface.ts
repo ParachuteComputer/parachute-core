@@ -68,8 +68,8 @@ export interface RecordSurfaceOpts {
   /** The caller's write stamp (`by`, `via`), as its record writes carry it. A type it defines records it, and write
    *  access may add fields to a type whose stamp is its own (type-write.ts). Omitted: nothing is recorded. */
   writer?: TypeWriter;
-  /** Where `docs` reads its pages and for which version (docs-tool.ts, T-476). Omitted: parachute.computer's latest
-   *  pages. `null`: no `docs` tool. */
+  /** Where `docs` reads its pages and for which version (docs-tool.ts, T-476). Omitted or `null`: no `docs` tool (a
+   *  door says where its docs are, so an operator's `off` can't be skipped by a door that forgot to pass it). */
   docs?: DocsToolOpts | null;
 }
 
@@ -90,7 +90,7 @@ export function shapeRecordSurface(tools: McpToolDef[], opts: RecordSurfaceOpts)
   };
   const surface = addRecordTools(applyElevenTools(tools, opts), opts.onUse, recordCheck);
   // T-476: Parachute's docs for this version, from the docs site, in place of the guides once seeded into each vault.
-  if (opts.docs !== null) surface.push(buildDocsTool(opts.docs ?? {}));
+  if (opts.docs) surface.push(buildDocsTool(opts.docs));
   const shaped = byToolOrder(surface);
   applyVaultInfoHelp(shaped, opts);
   applyParamTeaching(shaped, opts);

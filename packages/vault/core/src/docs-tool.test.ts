@@ -14,7 +14,7 @@ function site(pages = SITE) {
   const f = (async (url: string | URL, init?: RequestInit) => {
     const u = new URL(String(url));
     asked.push(u.pathname);
-    expect(init?.redirect).toBe("manual");
+    expect(init?.redirect).toBe("follow");
     const body = pages[u.pathname];
     return body === undefined ? new Response("not here", { status: 404 }) : new Response(body, { headers: { "content-type": "text/markdown" } });
   }) as typeof fetch;
@@ -181,7 +181,24 @@ describe("when the site is down", () => {
     await expect(tool.execute({ topic: "build/components" })).rejects.toMatchObject({ error_type: "unknown_topic" });
   });
 
-    test("a 5xx is the site down, not a missing page: the offline copy, never 'no page'", async () => {
+    test("a redirect is followed on the docs' own host (http to https), never off it", async () => {
+    const redirected = (to: string, body: string) =>
+      Object.defineProperties(new Response(body, { headers: { "content-type": "text/markdown" } }), { redirected: { value: true }, url: { value: to } });
+    const same = (async (url: string) => redirected(String(url).replace("http:", "https:"), "# Moved here")) as unknown as typeof fetch;
+    expect(((await buildDocsTool({ origin: "http://docs.example", fetch: same, cache: new Map() }).execute({ topic: "build/x" })) as { markdown: string }).markdown).toBe("# Moved here");
+    const off = (async () => redirected("https://elsewhere.example/docs/x.md", "# Not ours")) as unknown as typeof fetch;
+    await expect(buildDocsTool({ origin: "https://docs.example", fetch: off, cache: new Map() }).execute({ topic: "build/x" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
+    // a fix page has its built-in copy instead
+    expect(((await buildDocsTool({ origin: "https://docs.example", fetch: off, cache: new Map() }).execute({ topic: "fix/conflict" })) as { note: string }).note).toContain("redirected off the docs host");
+  });
+
+  test("an explicit heading id with an underscore is a section too", async () => {
+    const f = (async () => new Response("# Conflicts\n\n## Write without a precondition {#precondition_required}\n\nPass if_updated_at.\n\n## Next\n\nx\n")) as unknown as typeof fetch;
+    const r = (await buildDocsTool({ origin: "https://docs.example", fetch: f, cache: new Map() }).execute({ topic: "fix/conflict#precondition_required" })) as { markdown: string };
+    expect(r.markdown).toBe("## Write without a precondition {#precondition_required}\n\nPass if_updated_at.");
+  });
+
+  test("a 5xx is the site down, not a missing page: the offline copy, never 'no page'", async () => {
     const tool = buildDocsTool({ origin: "https://docs.example", fetch: (async () => new Response("bad gateway", { status: 502 })) as unknown as typeof fetch, cache: new Map() });
     expect(((await tool.execute({ topic: "fix/conflict" })) as { note: string }).note).toContain("(it answered 502)");
   });
@@ -370,6 +387,11 @@ describe("versions", () => {
     const junk = latestRelease("https://latest.example", { fetch: (async () => new Response("<html>")) as unknown as typeof fetch, now: () => t });
     await junk.refresh;
     expect(latestRelease("https://latest.example", { now: () => t }).value).toBeNull();
+    // and is tried again in ten minutes, not six hours
+    const good = (async () => new Response(JSON.stringify({ core: { latest: "0.9.1" } }))) as unknown as typeof fetch;
+    expect(latestRelease("https://latest.example", { fetch: good, now: () => t + 5 * 60 * 1000 }).refresh).toBeNull();
+    await latestRelease("https://latest.example", { fetch: good, now: () => t + 11 * 60 * 1000 }).refresh;
+    expect(latestRelease("https://latest.example", { now: () => t + 11 * 60 * 1000 }).value).toEqual({ latest: "0.9.1", beta: undefined });
     forgetLatestRelease();
   });
   test("a read that never settles (a Worker request ended under it) is given up, and the next caller starts another", async () => {
