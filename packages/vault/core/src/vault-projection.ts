@@ -35,6 +35,7 @@ import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
 import type { VaultStats, VaultMap } from "./types.ts";
 import { GETTING_STARTED_PATH } from "./seed-packs.ts";
+import { SKILL_TYPE } from "./skills.ts";
 
 /**
  * Does a note live at the seeded onboarding path? Used to gate the "Start here"
@@ -373,6 +374,11 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
   return `This connection can read only the records tagged ${list} (subtags included); other records are hidden from it.${can.scoped}`;
 }
 
+/** The one line that points an AI at the vault's own skills (records of type `skill`, written by an admin or a pack). */
+export const SKILLS_LINE =
+  "This vault keeps skills: instructions its owner wrote for you. `query-records { type: \"skill\" }` lists them, each " +
+  "with a `description`; before a task a description matches, read that skill in full and follow it.";
+
 /**
  * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
  * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
@@ -472,6 +478,15 @@ export function projectionToMarkdown(args: {
     );
   }
 
+  // T-476: the vault's own skills (core skills.ts), named only when this connection can see one. Every client reads
+  // this; a client with the MCP Skills extension also lists them itself.
+  if ((projection.map?.tags ?? []).some((t) => t.name === SKILL_TYPE && t.count > 0)) {
+    lines.push("");
+    lines.push("## Skills");
+    lines.push("");
+    lines.push(SKILLS_LINE);
+  }
+
   lines.push("");
   lines.push("## Quick orientation (call `vault-info` for full schema)");
   lines.push("");
@@ -554,7 +569,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   // T-476: one line, not the five hints (`vault-info` still returns them): query-records' own description, which
   // every client reads with the tool list, says each filter, so the brief keeps its budget for what only it can say.
-  lines.push(w("`query-notes { type: \"X\" }` lists a type, subtypes too; the tool's description has every filter (`metadata` operators, `search`, `near`, `id`)."));
+  lines.push(w("`query-notes { type: \"X\" }` lists a type, subtypes too; its description and parameters list each filter (`metadata` operators, `search`, `near`, `id`)."));
 
   lines.push("");
   lines.push("## Refreshing context");

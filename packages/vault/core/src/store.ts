@@ -67,6 +67,7 @@ import { runDoctorScan, type DoctorReport, type DoctorScanOpts } from "./doctor.
 import { EmbeddingError, type EmbeddingProvider } from "./embedding/provider.js";
 import { normalize } from "./embedding/vector-codec.js";
 import { QueryError } from "./query-operators.js";
+import { isSkillTags, skillTypeNames } from "./skills.js";
 
 /**
  * Normalize a `type: "reference"` field value (scalar OR array — see
@@ -686,6 +687,8 @@ export class BunSqliteStore implements Store {
        * verbatim. Ignored when `updates.metadata` is undefined.
        */
       tagsForSchemaResolution?: string[];
+      /** T-476: a rename rewrites links in skills only when the writer may write skills (types.ts Store.updateNote). */
+      maySkills?: boolean;
       /**
        * Scope gap 1: which notes a tag-scoped writer may see. A `[[wikilink]]`
        * or reference-field value naming a note outside that set resolves as
@@ -756,10 +759,10 @@ export class BunSqliteStore implements Store {
 
       if (updates.path !== undefined && note.path) {
         if (cascadePlan && oldPath && oldPath !== note.path) {
-          this.cascadeRename(cascadePlan, note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null }, rewritten);
+          this.cascadeRename(cascadePlan, note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null }, rewritten, updates.maySkills === true);
         }
         if (oldPath && oldPath !== note.path) {
-          this.repairReferenceFieldPaths(note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null }, rewritten);
+          this.repairReferenceFieldPaths(note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null }, rewritten, updates.maySkills === true);
         }
         resolveUnresolvedWikilinks(this.db, note.path, id);
         // vault#581 — a rename is one of the two ways an ambiguity stops being
@@ -869,14 +872,18 @@ export class BunSqliteStore implements Store {
    * `unresolved_wikilinks` and `ambiguous_wikilinks` stay consistent with
    * the new text.
    */
-  private cascadeRename(plan: Map<string, string[]>, note: Note, oldPath: string, attr: { actor: string | null; via: string | null }, rewritten?: Set<string>): void {
+  private cascadeRename(plan: Map<string, string[]>, note: Note, oldPath: string, attr: { actor: string | null; via: string | null }, rewritten?: Set<string>, maySkills = false): void {
     if (plan.size === 0 || !note.path) return;
     const newPath = note.path;
 
     // One resolution per distinct bracket text, shared across sources.
     const replacement = new Map<string, string>();
+    let skillTypes: Set<string> | undefined;
 
     for (const [sourceId, targets] of plan) {
+      // T-476: the new path is the renamer's text; written into a skill's body it would be instructions only an admin
+      // may write. Without that, the skill keeps its link text as it was.
+      if (!maySkills && isSkillTags(noteOps.getNoteTags(this.db, sourceId), (skillTypes ??= skillTypeNames(this.db)))) continue;
       const row = this.db.prepare("SELECT content FROM notes WHERE id = ?")
         .get(sourceId) as { content: string } | null;
       if (!row?.content) continue;
@@ -931,7 +938,7 @@ export class BunSqliteStore implements Store {
    * caller's transaction; the indexed generated columns recompute from the
    * metadata JSON on write.
    */
-  private repairReferenceFieldPaths(note: Note, oldPath: string, attr: { actor: string | null; via: string | null }, rewritten?: Set<string>): void {
+  private repairReferenceFieldPaths(note: Note, oldPath: string, attr: { actor: string | null; via: string | null }, rewritten?: Set<string>, maySkills = false): void {
     if (!note.path) return;
     const oldKey = normalizePath(oldPath)?.toLowerCase();
     if (!oldKey) return;
@@ -940,6 +947,7 @@ export class BunSqliteStore implements Store {
     ).all(note.id, note.id) as { source_id: string; relationship: string }[];
     if (rows.length === 0) return;
 
+    let skillTypes: Set<string> | undefined;
     const fieldsBySource = new Map<string, Set<string>>();
     for (const r of rows) {
       let set = fieldsBySource.get(r.source_id);
@@ -953,6 +961,8 @@ export class BunSqliteStore implements Store {
     for (const [sourceId, relationships] of fieldsBySource) {
       const source = noteOps.getNote(this.db, sourceId);
       if (!source?.metadata) continue;
+      if (!maySkills && isSkillTags(source.tags, (skillTypes ??= skillTypeNames(this.db)))) continue; // T-476: as cascadeRename above
+
       const resolution = resolveNoteSchemas(this.getSchemaConfig(), { tags: source.tags ?? [] });
       if (resolution.mergedFields.size === 0) continue;
       // Skip sources whose tags declare no reference fields at all.

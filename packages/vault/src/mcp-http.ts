@@ -336,6 +336,10 @@ export async function handleMcp(
       if (e?.code === "PUBLISH_OUT_OF_SCOPE") {
         throw mcpDomainError(ErrorCode.InvalidRequest, message, { error_type: "tag_scope_violation" });
       }
+      // T-476: a skill is instructions every connected AI may follow; only an admin key adds or changes one.
+      if (e?.code === "SKILL_NEEDS_ADMIN") {
+        throw mcpDomainError(ErrorCode.InvalidRequest, message, { error_type: "skill_needs_admin", hint: e.hint });
+      }
       if (e?.code === "SCHEMA_VALIDATION") {
         throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: "schema_validation",
