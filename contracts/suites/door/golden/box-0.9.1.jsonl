@@ -204,7 +204,7 @@
 {"key":"mcp/admin.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.query-records.present","value":true}
 {"key":"mcp/admin.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/admin.tool.query-records.words","value":"004928dd42f9c5dd"}
+{"key":"mcp/admin.tool.query-records.words","value":"f59318f3e5ee4cbe"}
 {"key":"mcp/admin.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.read-attachment.present","value":true}
 {"key":"mcp/admin.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -228,7 +228,7 @@
 {"key":"mcp/admin.tool.update-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-record.present","value":true}
 {"key":"mcp/admin.tool.update-record.schema","value":"1e39438587b403ef"}
-{"key":"mcp/admin.tool.update-record.words","value":"afd69878fc69e3b9"}
+{"key":"mcp/admin.tool.update-record.words","value":"e43c54902d4f5b03"}
 {"key":"mcp/admin.tool.update-tag.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-tag.present","value":true}
 {"key":"mcp/admin.tool.update-tag.schema","value":"ca7b0b3fc10294db"}
@@ -298,7 +298,7 @@
 {"key":"mcp/read.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.query-records.present","value":true}
 {"key":"mcp/read.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/read.tool.query-records.words","value":"004928dd42f9c5dd"}
+{"key":"mcp/read.tool.query-records.words","value":"f59318f3e5ee4cbe"}
 {"key":"mcp/read.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.read-attachment.present","value":true}
 {"key":"mcp/read.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -380,7 +380,7 @@
 {"key":"mcp/write.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.query-records.present","value":true}
 {"key":"mcp/write.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/write.tool.query-records.words","value":"004928dd42f9c5dd"}
+{"key":"mcp/write.tool.query-records.words","value":"f59318f3e5ee4cbe"}
 {"key":"mcp/write.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.read-attachment.present","value":true}
 {"key":"mcp/write.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -400,7 +400,7 @@
 {"key":"mcp/write.tool.update-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.update-record.present","value":true}
 {"key":"mcp/write.tool.update-record.schema","value":"1e39438587b403ef"}
-{"key":"mcp/write.tool.update-record.words","value":"afd69878fc69e3b9"}
+{"key":"mcp/write.tool.update-record.words","value":"e43c54902d4f5b03"}
 {"key":"mcp/write.tool.vault-info.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.vault-info.present","value":true}
 {"key":"mcp/write.tool.vault-info.schema","value":"530ff43b9f863786"}
