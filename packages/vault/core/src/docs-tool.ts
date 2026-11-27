@@ -175,9 +175,11 @@ export const refusalTopic = (type: string): string => (Object.hasOwn(REFUSAL_DOC
 const fixFor = (code: unknown): string | undefined => (typeof code === "string" && Object.hasOwn(REFUSAL_DOCS, code) ? REFUSAL_DOCS[code] : undefined);
 
 /** The person's step for a refusal only they can fix, when the refusal names none (T-476 eval). Checked against the
- *  approval page (one tick per level, packages/hub/src/oauth-ui.ts) and `parachute keys new … --can`. */
+ *  approval page (admin starts unticked, offered under "Grant additional access", packages/hub/src/oauth-ui.ts; a
+ *  Reconnect of a read-and-write grant approves silently, so the connection is ended first, core #166) and
+ *  `parachute keys new … --can`. */
 export const PERSON_STEPS: Readonly<Record<string, string>> = {
-  insufficient_scope: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page (for a script, a key made with that level).",
+  insufficient_scope: "Only the person can grant it: they end this AI's connection in the vault's list of who reaches it, connect it again, and tick admin on Parachute's approval page (it starts unticked, under \"Grant additional access\"). For a script: a key made with that level.",
 };
 
 type Result = { content: { type: string; [k: string]: unknown }[]; structuredContent?: Record<string, unknown>; isError?: boolean; [k: string]: unknown };
@@ -337,7 +339,7 @@ export const OFFLINE_PAGES: Readonly<Record<string, { title: string; summary: st
     summary: "A connection reaches one vault at one level: read, write or admin. A refusal or a missing tool means this one is below what the act needs.",
     body:
       "Every connection reaches a vault at one level. Read sees records; write also creates, changes and deletes them and may define types; admin also manages keys, the vault's description and skills. A tool above a connection's level isn't listed for it.\n\n" +
-      "The fix is the person's, not the AI's: they connect this AI again (remove it in their AI app and add it back) and leave the level it needs ticked on the Parachute approval page that opens. On their own server they can also make a key with that level: `parachute keys new <name> --vault <vault> --can admin`. Don't try another way round the refusal; tell the person what you were trying and which level it needs.",
+      "The fix is the person's, not the AI's: they end this AI's connection in the vault's list of who reaches it, connect it again, and tick the level on the Parachute approval page that opens (admin starts unticked, under \"Grant additional access\"). A plain reconnect keeps the old level without asking. On their own server they can also make a key with that level: `parachute keys new <name> --vault <vault> --can admin`. Don't try another way round the refusal; tell the person what you were trying and which level it needs.",
   },
   "fix/unknown-type": {
     title: "A type that isn't there",

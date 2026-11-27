@@ -76,9 +76,11 @@ export const REFUSAL_DOCS: Readonly<Record<string, string>> = {
 export const refusalTopic = (type: string): string => (Object.hasOwn(REFUSAL_DOCS, type) ? REFUSAL_DOCS[type]! : "fix/refusals");
 
 /** The person's step for a refusal only they can fix, when the refusal names none (T-476 eval). Checked against the
- *  approval page (one tick per level, packages/hub/src/oauth-ui.ts) and `parachute keys new … --can`. */
+ *  approval page (admin starts unticked, offered under "Grant additional access", packages/hub/src/oauth-ui.ts; a
+ *  Reconnect of a read-and-write grant approves silently, so the connection is ended first, core #166) and
+ *  `parachute keys new … --can`. */
 export const PERSON_STEPS: Readonly<Record<string, string>> = {
-  insufficient_scope: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page (for a script, a key made with that level).",
+  insufficient_scope: "Only the person can grant it: they end this AI's connection in the vault's list of who reaches it, connect it again, and tick admin on Parachute's approval page (it starts unticked, under \"Grant additional access\"). For a script: a key made with that level.",
 };
 
 type Result = { content: { type: string; [k: string]: unknown }[]; structuredContent?: Record<string, unknown>; isError?: boolean; [k: string]: unknown };

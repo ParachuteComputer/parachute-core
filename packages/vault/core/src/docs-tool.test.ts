@@ -151,7 +151,7 @@ describe("when the site is down", () => {
     const tool = buildDocsTool({ origin: "https://docs.example", version: "0.9.0-pre.2", fetch: down, cache: new Map() });
     const r = (await tool.execute({ topic: "fix/needs-admin" })) as { markdown: string; note: string; page: string };
     expect(r.markdown).toStartWith("# Needs admin");
-    expect(r.markdown).toContain("leave the level it needs ticked on the Parachute approval page");
+    expect(r.markdown).toContain("end this AI's connection in the vault's list of who reaches it, connect it again, and tick the level");
     expect(r.note).toBe("Offline copy: https://docs.example/docs/v/0.9/fix/needs-admin/ couldn't be read (getaddrinfo ENOTFOUND).");
     const [block] = tool.resultContent!(r) as { text: string }[];
     expect(block.text).toStartWith("(Offline copy: ");
@@ -313,7 +313,7 @@ describe("refusals and warnings point at their fix", () => {
     expect(withRefusalDocs(bare, ctx).structuredContent).toEqual({
       error_type: "insufficient_scope",
       message: "needs admin",
-      hint: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page (for a script, a key made with that level).",
+      hint: "Only the person can grant it: they end this AI's connection in the vault's list of who reaches it, connect it again, and tick admin on Parachute's approval page (it starts unticked, under \"Grant additional access\"). For a script: a key made with that level.",
       docs: "https://parachute.computer/docs/v/0.9/fix/needs-admin/#what-the-refusal-says",
     });
     expect(withRefusalDocs(refused("insufficient_scope"), ctx).structuredContent!.hint).toBe("h");

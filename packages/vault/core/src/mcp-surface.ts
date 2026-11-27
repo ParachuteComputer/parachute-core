@@ -182,7 +182,7 @@ function applyElevenTools(tools: McpToolDef[], opts: RecordSurfaceOpts): McpTool
           }
           if (!writeMay || problem) {
             const why = problem ? ` ${problem.message}` : name === "manage-types" && opts.hasVerb("write") ? " With write access you can make a new type, and add fields to a type you made (action update)." : "";
-            // A refusal (T-476), not a crash: untagged, it was answered `internal_error` and logged as one.
+            // A refusal the person can fix (T-476: the needs-admin page and their step ride on it), never a crash.
             throw Object.assign(new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.${why}`), {
               error_type: "insufficient_scope",
             });
