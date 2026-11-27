@@ -60,6 +60,17 @@ describe.skipIf(!is09)("the record door over MCP", () => {
     }
   });
 
+  // T-476: an open live page isn't told of a change made elsewhere, and claude.ai re-reads a watch only on an interval
+  // (measured 2026-11-27). So the connect-time brief must name the interval, on every door.
+  test("the brief's live-page words make an open page read again on its own", async () => {
+    const c = await mcp("read");
+    try {
+      expect(c.client.getInstructions() ?? "").toMatch(/refetchInterval:\s*30000/);
+    } finally {
+      await c.close();
+    }
+  });
+
   // T-476: a live page (a Claude artifact) is written from these words alone, with no model in the loop to recover
   // from a wrong key. So the concurrency token the update-record words and the connect-time brief name must be a key a
   // record read carries, and a write armed with it must land, and a stale one be refused.
@@ -71,7 +82,6 @@ describe.skipIf(!is09)("the record door over MCP", () => {
       expect(named, words).toBeTruthy();
       const brief = c.client.getInstructions() ?? "";
       expect(/if_updated_at: record\.(\w+)/.exec(brief)?.[1], "the brief's live-page words name the same key").toBe(named!);
-      expect(brief, "the brief's live-page words make an open page read again on its own").toContain("refetchInterval: 30000");
       const path = `records/${runId("page")}`;
       await c.call("create-record", { path, fields: { status: "open" }, body: "Water the beds." });
       const r = one(await c.call("query-records", { id: path }));

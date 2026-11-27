@@ -249,12 +249,13 @@ viewer's Claude): \`query-records\` to read, \`update-record\` to change, \`crea
 
 ## Read
 
-- \`watchTool(server, "query-records", input, handler)\` for what is on screen: read-only, cached, refreshable.
+- \`watchTool(server, "query-records", input, handler, { refetchInterval: 30000 })\` for what is on screen:
+  read-only, cached, read again every 30 seconds.
 - Filter by \`type\` (tasks: \`{ type: "task" }\`), \`path_prefix\` or \`fields\`. The \`vault-guide\` skill lists this
   vault's types and fields; use its names and words on the page.
 - The reply's first text block is JSON (the page reads it as \`payload\`): one record for \`id\`, an array, or
-  \`{ records, next_cursor }\` when it pages. Handle both list shapes. A missing record answers
-  \`{ error, error_type: "not_found" }\`.
+  \`{ records, next_cursor }\` when it pages. Handle both list shapes. A missing record is a refusal
+  (\`not_found\`).
 - A record has \`id\`, \`path\`, \`types\`, \`tags\`, \`fields\`, \`body\` and \`updatedAt\`. Its name is the last part of
   its \`path\`; there is no \`title\`.
 
@@ -270,16 +271,19 @@ viewer's Claude): \`query-records\` to read, \`update-record\` to change, \`crea
 ## Keep it current
 
 An open page isn't told when a record changes elsewhere (another chat, the Parachute app, another AI). It sees the
-change when it reads again, so build these in every time (measured in claude.ai, 2026-11-27):
+change when it reads again. Build these in every time. (Measured in claude.ai, 2026-11-27.)
 
-- Give the watch \`{ refetchInterval: 30000 }\`. Thirty seconds is the shortest claude.ai allows; a lower number is
-  raised to it. With no interval the page reads once, when it opens.
-- The interval pauses while the page is hidden and reads again within a second when the person comes back. Don't add
-  a focus or visibility handler.
+- The interval is the watch's fifth argument, its options, not part of \`input\`. Thirty seconds is the shortest
+  claude.ai allows; a lower number is raised to it. With no interval the page reads only when it opens and when it
+  calls \`invalidate\`.
+- The interval pauses while the page is hidden and reads again in about a second when the person comes back. Don't
+  add a focus or visibility handler.
 - Show when the page last read ("Updated just now", "Updated 2 min ago"): \`result.cache.storedAt\` when the result
-  has a \`cache\` marker, else the time it arrived. Keep the line ticking.
+  has a \`cache\` marker, else the time it arrived. Redraw the line every few seconds so the age stays true.
 - Beside it, a Refresh button that calls \`invalidate\`: every watch reads again at once.
-- When a read fails, keep the last rows on screen and say "Couldn't refresh" beside the time. Never blank the page.
+- When a read fails, look at \`error.code\`. Lost access (\`needs_reauth\`, \`server_not_connected\`,
+  \`approval_required\`, \`blocked_by_policy\`): clear the rows and say what to do. Anything else: keep the last rows
+  and say "Couldn't refresh" beside the time.
 - When a read brings a change made elsewhere, mark that row for a moment so the person sees what moved.
 - Don't redraw a row while the person is typing in it; redraw when they leave it.
 
