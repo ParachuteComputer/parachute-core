@@ -181,11 +181,11 @@ function shapeError(field: string, message: string, hint: string, index?: number
 }
 
 /**
- * Structured links (`links` on create, `links.add` on update): each `{target, relationship}` with both a non-empty
- * string. The relationship has no default: a link without one is refused (before T-476 it crashed when the target
- * existed and was lost when it didn't).
+ * Structured links (`links` on create, `links.add` / `links.remove` on update): each `{target, relationship}` with a
+ * non-empty string target. Adding needs a relationship too, with no default: a link without one is refused (before
+ * T-476 it crashed when the target existed and was lost when it didn't). Removing without one is allowed, as before.
  */
-function checkLinkEntries(links: unknown, field: string, index?: number): void {
+function checkLinkEntries(links: unknown, field: string, index?: number, needsRelationship = true): void {
   if (links === undefined || links === null) return;
   if (!Array.isArray(links)) {
     throw shapeError(field, `\`${field}\` must be an array of {target, relationship}.`, '[{"target": "People/Ada", "relationship": "mentions"}]', index);
@@ -197,7 +197,8 @@ function checkLinkEntries(links: unknown, field: string, index?: number): void {
     if (!isNameString(link.target)) {
       throw shapeError(`${field}.${i}.target`, `\`${field}[${i}].target\` must be a record's path, title or id.`, '"target": "People/Ada"', index);
     }
-    if (!isNameString(link.relationship)) {
+    const rel = link.relationship;
+    if (needsRelationship ? !isNameString(rel) : rel !== undefined && rel !== null && typeof rel !== "string") {
       throw shapeError(`${field}.${i}.relationship`, `\`${field}[${i}].relationship\` is required: what the link means.`, '"relationship": "mentions" (any word: "related", "about", "parent")', index);
     }
   });
@@ -206,12 +207,12 @@ function checkLinkEntries(links: unknown, field: string, index?: number): void {
 /** create-note's arguments, every item, before any write (T-476): what the tool would otherwise crash on. */
 function checkCreateShapes(batch: unknown, items: unknown[]): void {
   if (batch !== undefined && batch !== null && !Array.isArray(batch)) {
-    throw shapeError("notes", "`notes` must be an array of notes.", 'notes: [{"path": "Notes/A", "content": "..."}]');
+    throw shapeError("notes", "`notes` must be an array of notes.", "an array of objects, each with `path`, `content` and the rest");
   }
   const batched = Array.isArray(batch);
   items.forEach((raw, n) => {
     const index = batched ? n : undefined;
-    if (!isPlainObject(raw)) throw shapeError("notes", "Each entry in `notes` must be an object.", '{"path": "Notes/A", "content": "..."}', index);
+    if (!isPlainObject(raw)) throw shapeError("notes", "This entry must be an object, not a list or a single value.", "an object with `path`, `content` and the rest", index);
     const item = raw;
     for (const key of ["path", "content", "created_at"] as const) {
       const v = item[key];
@@ -2122,9 +2123,11 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             });
           }
         }
-        // T-476: a `links.add` entry without a relationship (or a string where an object goes) crashed mid-write.
+        // T-476: a `links.add` entry without a relationship, or a string where a link object goes, crashed mid-write.
         items.forEach((item: any, n: number) => {
-          if (isPlainObject(item?.links)) checkLinkEntries(item.links.add, "links.add", batch ? n : undefined);
+          if (!isPlainObject(item?.links)) return;
+          checkLinkEntries(item.links.add, "links.add", batch ? n : undefined);
+          checkLinkEntries(item.links.remove, "links.remove", batch ? n : undefined, false);
         });
 
         if (items.length > MAX_BATCH_SIZE) {

@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { BunSqliteStore } from "./store.ts";
 import { generateMcpTools } from "./mcp.ts";
 import { shapeRecordSurface } from "./mcp-surface.ts";
+import { refusalOfError } from "./mcp-refusal.ts";
 
 function vault() {
   const store = new BunSqliteStore(new Database(":memory:"));
@@ -15,11 +16,12 @@ function vault() {
   return { store, call, count };
 }
 
+/** The thrown error's own properties, and what a door puts on the wire for it (core mcp-refusal.ts, both doors). */
 async function refusal(p: Promise<unknown>): Promise<Record<string, unknown>> {
   try {
     await p;
   } catch (e) {
-    return { class: (e as Error).constructor.name, ...(e as object), message: (e as Error).message };
+    return { class: (e as Error).constructor.name, ...(e as object), message: (e as Error).message, wire: refusalOfError(e) };
   }
   throw new Error("expected a refusal");
 }
@@ -65,7 +67,18 @@ describe("create-record refuses a wrong shape before writing", () => {
     const r = await refusal(v.call("create-record", { records: [{ path: "A", body: "a" }, { path: "B", links: [{ target: "A" }] }] }));
     expect(r).toMatchObject({ error_type: "invalid_query", field: "links.0.relationship", index: 1 });
     expect(r.message).toStartWith("In item 1 of `records`:");
+    // What the caller receives: the same field and index (refusalOfError used to drop index).
+    expect(r.wire).toMatchObject({ error_type: "invalid_query", field: "links.0.relationship", index: 1 });
     expect(v.count()).toBe(0);
+  });
+
+  test("on the record door the words say body and records, never content or notes", async () => {
+    const v = vault();
+    for (const args of [{ records: 5 }, { records: [5] }, { path: "A", body: 5 }]) {
+      const r = await refusal(v.call("create-record", args));
+      const words = `${r.message} ${(r.wire as Record<string, unknown>).hint}`;
+      expect(words, JSON.stringify(args)).not.toMatch(/content|notes/);
+    }
   });
 
   test("the note door words it as notes", async () => {
@@ -110,6 +123,22 @@ describe("update-record's links.add", () => {
     expect(r).toMatchObject({ class: "Error", error_type: "invalid_query", field: "links.add.0.relationship" });
     const b = (await v.call("query-records", { id: "B" })) as { body: string };
     expect(b.body).toBe("b");
+  });
+  test("a bad item in a batch names its index", async () => {
+    const v = vault();
+    await v.call("create-record", { path: "A", body: "a" });
+    await v.call("create-record", { path: "B", body: "b" });
+    const r = await refusal(v.call("update-record", { force: true, records: [{ id: "A", body: "a2" }, { id: "B", links: { add: [{ target: "A" }] } }] }));
+    expect(r.wire).toMatchObject({ error_type: "invalid_query", field: "links.add.0.relationship", index: 1 });
+    expect(((await v.call("query-records", { id: "A" })) as { body: string }).body).toBe("a");
+  });
+  test("links.remove: a string entry is refused; no relationship is fine (it removes by target, as before)", async () => {
+    const v = vault();
+    await v.call("create-record", { path: "A", body: "a" });
+    await v.call("create-record", { path: "B", body: "b", links: [{ target: "A", relationship: "r" }] });
+    const r = await refusal(v.call("update-record", { id: "B", force: true, links: { remove: ["A"] } }));
+    expect(r).toMatchObject({ class: "Error", error_type: "invalid_query", field: "links.remove.0" });
+    await v.call("update-record", { id: "B", force: true, links: { remove: [{ target: "A" }] } });
   });
   test("a string entry is refused", async () => {
     const v = vault();
