@@ -23,8 +23,8 @@ stored with `add-attachment` (T-476).
 
 **Live pages stay current.** The `live-page` skill and the brief's live-pages line now tell an AI to build a page
 that reads again every 30 seconds while it is on screen (`refetchInterval: 30000`, claude.ai's shortest), shows when
-it last read, and has a Refresh. Measured in claude.ai: a page with no interval reads only when it opens and after
-its own writes; one with an interval pauses while hidden and catches up in about a second on return. Before, Claude
+it last read, and has a Refresh. Measured in claude.ai: a page with no interval reads only when it opens and when
+it calls `invalidate`; one with an interval pauses while hidden and catches up in about a second on return. Before, Claude
 chose 60 seconds on its own (T-476).
 
 ## 0.9.0-pre.2

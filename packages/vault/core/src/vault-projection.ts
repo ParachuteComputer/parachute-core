@@ -381,7 +381,8 @@ export const SKILLS_LINE =
   "with a `description`; before a task a description matches, read that skill in full and follow it.";
 
 /**
- * How to build a live page on this vault (T-476, measured in the real claude.ai on 2026-11-27, contract 0.2.99). In
+ * How to build a live page on this vault (T-476: how a page refreshes and how a refusal reaches it were measured in
+ * the real claude.ai on 2026-11-27, artifact runtime contract 0.2.99; livedemo FINDINGS.md). In
  * record words: every door that sends this brief lists the record tools. The reply shapes and a record's keys are in
  * query-records' own description; the long form is the docs page it names and the `live-page` skill.
  */
@@ -389,7 +390,8 @@ export const LIVE_PAGE_BLOCK =
   "A Claude artifact reads with `watchTool` on `query-records`, with options `{ refetchInterval: 30000 }`, so an open " +
   "page picks up changes made elsewhere. It shows when it last read, beside a Refresh that calls `invalidate`. It " +
   "writes on a click with `update-record` (`if_updated_at: record.updatedAt`), then calls `invalidate`; on a conflict " +
-  "it reads again; a refusal rejects with `tool_error`, the reason in its message. Guide: " +
+  "it reads again. A refusal rejects with `tool_error`; `error.result.structuredContent` has its `error_type` and " +
+  "`message`. Guide: " +
   "https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
