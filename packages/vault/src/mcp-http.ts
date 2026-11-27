@@ -22,7 +22,8 @@ import { mcpCallResult } from "../core/src/mcp-result.ts";
 import { internalRefusal, refusalOfError, refusalResult, unknownToolRefusal, type McpRefusal } from "../core/src/mcp-refusal.ts";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { APPLET_URI_PREFIX, MCP_APP_MIME, OPEN_PREFIX, appletUri, approvalKeys, approvedApplets, hubOrigins, openTool, resourceOf, viewHtml, type ApprovedApplet } from "./mcp-app.ts";
 import { boxDocs, generateScopedMcpTools, getServerInstruction, scopedProjection } from "./mcp-tools.ts";
 import { handleModernMcp, isLegacyRequest } from "./mcp-modern.ts";
 import { vaultSkillSource } from "./mcp-skills.ts";
@@ -85,15 +86,16 @@ export async function handleScopedMcp(
   // the door; given a parsed body the check applies no size cap of its own, so a large 2025 request stays 2025.
   const parsedBody = await jsonBody(req);
   if (!(await isLegacyRequest(req, parsedBody))) {
-    const tools = toolSurface(getTools, vaultName, auth);
+    const view = viewHtml();
+    const tools = toolSurface(getTools, vaultName, auth, view ? { bearer: callerBearer ?? null } : undefined);
     const skills = vaultSkillSource({
       vaultName,
       projection: () => scopedProjection(vaultName, auth),
       queryRecords: tools.byName("query-records"),
     });
-    return handleModernMcp(req, { serverName, instruction, tools, skills }, parsedBody);
+    return handleModernMcp(req, { serverName, instruction, tools, skills, views: view ? appletViews(tools, view, vaultName) : undefined }, parsedBody);
   }
-  return handleMcp(req, getTools, serverName, vaultName, auth, instruction, parsedBody);
+  return handleMcp(req, getTools, serverName, vaultName, auth, instruction, { bearer: callerBearer ?? null, parsedBody });
 }
 
 /** A POST's JSON body, read from a clone; undefined for anything else (the transports then answer it themselves). */
@@ -115,42 +117,78 @@ export async function handleMcp(
   vaultName: string,
   auth: AuthResult,
   instruction: string,
-  parsedBody?: unknown,
+  opts: { bearer?: string | null; parsedBody?: unknown } = {},
 ): Promise<Response> {
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
   });
 
+  // The vault's approved applets as an MCP App (mcp-app.ts): each its own tool and ui:// view. With a view to serve,
+  // the door offers resources; the applets themselves are read only when a request needs them, once per request.
+  const view = viewHtml();
   const server = new Server(
     { name: serverName, version: "0.1.0" },
     {
-      capabilities: { tools: {} },
+      capabilities: view ? { tools: {}, resources: {} } : { tools: {} },
       instructions: instruction,
     },
   );
 
-  const tools = toolSurface(getTools, vaultName, auth);
-  server.setRequestHandler(ListToolsRequestSchema, async (request) => ({ tools: tools.list(request.params?._meta) }));
+  const tools = toolSurface(getTools, vaultName, auth, view ? { bearer: opts.bearer ?? null } : undefined);
+  server.setRequestHandler(ListToolsRequestSchema, async (request) => ({ tools: await tools.list(request.params?._meta) }));
   server.setRequestHandler(CallToolRequestSchema, (request) => tools.call(request));
+  if (view) {
+    const views = appletViews(tools, view, vaultName);
+    server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: await views.list() }));
+    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      const r = await views.read(request.params.uri);
+      if (!r) throw new McpError(ErrorCode.InvalidParams, `No resource ${request.params.uri}`);
+      return r;
+    });
+  }
 
   await server.connect(transport);
-  return transport.handleRequest(req, parsedBody === undefined ? undefined : { parsedBody });
+  return transport.handleRequest(req, opts.parsedBody === undefined ? undefined : { parsedBody: opts.parsedBody });
+}
+
+/**
+ * The approved applets' views (`ui://parachute/applet/<id>`) for one request, as both eras serve them: the 2025 door
+ * as its resources, the 2026-07-28 door beside the Skills extension's files (mcp-modern.ts). `read` is null for a view
+ * this key may not open, so that answer is the same as for one that doesn't exist.
+ */
+export function appletViews(tools: ReturnType<typeof toolSurface>, view: string, vaultName: string): AppletViews {
+  return {
+    list: async () => (await tools.applets()).map((a) => ({ uri: appletUri(a.id), name: a.name, title: a.name, mimeType: MCP_APP_MIME })),
+    read: async (uri) => {
+      const a = uri.startsWith(APPLET_URI_PREFIX) ? (await tools.applets()).find((x) => appletUri(x.id) === uri) : undefined;
+      return a ? resourceOf(view, a, vaultName) : null;
+    },
+  };
+}
+
+export interface AppletViews {
+  list: () => Promise<Array<{ uri: string; name: string; title: string; mimeType: string }>>;
+  read: (uri: string) => Promise<ReturnType<typeof resourceOf> | null>;
 }
 
 /**
  * The vault's tools for one request: what `tools/list` shows this key and how `tools/call` runs one. Both MCP eras
- * serve these same handlers (T-476): the 2025 path above and the 2026-07-28 path in mcp-modern.ts.
+ * serve these same handlers (T-476): the 2025 path above and the 2026-07-28 path in mcp-modern.ts. With `app` (when
+ * the door has a view to serve), the vault's approved applets are tools too, one `open-<id>` each (mcp-app.ts).
  */
 export function toolSurface(
   getTools: () => McpToolDef[],
   vaultName: string,
   auth: AuthResult,
+  app?: { bearer: string | null },
   /** Where a refusal's fix page is (T-476). Omitted: this box's own (`boxDocs`). */
   docs: DocsContext = boxDocs(),
 ): {
-  list: (meta?: unknown) => Array<{ name: string; description: string; inputSchema: Record<string, unknown>; annotations: ReturnType<typeof toolAnnotations> }>;
+  list: (meta?: unknown) => Promise<Array<{ name: string; description: string; inputSchema: Record<string, unknown>; annotations: unknown; title?: string; _meta?: Record<string, unknown> }>>;
   call: (request: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<any>;
+  /** The applets this key may open (none without `app`), read once per request. */
+  applets: () => Promise<ApprovedApplet[]>;
   /** The tools this key can see, by name (mcp-skills.ts reads skill records through query-records). */
   byName: (name: string) => McpToolDef | undefined;
 } {
@@ -174,21 +212,32 @@ export function toolSurface(
   // The level that decides what is listed (a tag-scoped admin sees manage-keys): what an unknown tool's refusal says
   // the caller has (T-476), so it never tells an admin to ask for admin.
   const listed = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
+  // A reader's door: the applets are read through its own query-records, so they are what the caller may read.
+  let applets: Promise<ApprovedApplet[]> | null = null;
+  const approved = () => (applets ??= app && hasScopeForVault(auth.scopes, vaultName, "read")
+    ? approvalKeys(app.bearer).then((keys) => approvedApplets(visibleTools, vaultName, keys, hubOrigins()))
+    : Promise.resolve([]));
   return {
     // `meta`: the request's `_meta` (T-476: a file argument is marked `x-mcp-file` only for a client that declared the
     // file-transfer extension).
-    list: (meta?: unknown) =>
-      visibleTools.map((t) => ({
+    list: async (meta?: unknown) => [
+      ...visibleTools.map((t) => ({
         name: t.name,
         description: t.description,
         inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(meta)),
         annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
       })),
+      ...(await approved()).map((a) => {
+        const t = openTool(a, vaultName);
+        return { name: t.name, title: t.title, description: t.description, inputSchema: t.inputSchema, annotations: t.annotations, _meta: t._meta };
+      }),
+    ],
     // One way to refuse (core/src/mcp-refusal.ts): every refusal is an `isError` result with `structuredContent
     // {error_type, message, ...}`, never a JSON-RPC error, on both eras' doors. A record tool's is said in its own
     // words (T-407).
     // T-476: every refusal carries `docs`, the page with its fix for this version (docs-tool.ts).
     call: async (request) => withRefusalDocs(await callTool(request), docs),
+    applets: approved,
     byName: (name) => visibleTools.find((t) => t.name === name),
   };
 
@@ -196,7 +245,8 @@ export function toolSurface(
     const { name, arguments: args } = request.params;
     // Dispatch against the FILTERED tool list: a tool the caller can't see in `tools/list` can't be called either
     // (vault#376), and the refusal is the same as for a tool that doesn't exist, so nothing leaks.
-    const tool = visibleTools.find((t) => t.name === name);
+    const tool = visibleTools.find((t) => t.name === name)
+      ?? (name.startsWith(OPEN_PREFIX) ? (await approved()).map((a) => openTool(a, vaultName)).find((t) => t.name === name) : undefined);
     if (!tool) return refusalResult(unknownToolRefusal(name, listed));
     try {
       // `resultContent`, when a tool defines it, decides the content blocks (read-attachment's image, the note

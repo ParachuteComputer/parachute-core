@@ -26,7 +26,7 @@ export interface McpToolAnnotations {
   openWorldHint: boolean;
 }
 
-const READ: McpToolAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+export const READ: McpToolAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 /** Adds, never overwrites (an upload ticket). */
 const ADD: McpToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 /** Can overwrite or remove. */
