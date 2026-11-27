@@ -183,7 +183,7 @@ function shapeError(field: string, message: string, hint: string, index?: number
 /**
  * Structured links (`links` on create, `links.add` / `links.remove` on update): each `{target, relationship}` with a
  * non-empty string target. Adding needs a relationship too, with no default: a link without one is refused (before
- * T-476 it crashed when the target existed and was lost when it didn't). Removing without one is allowed, as before.
+ * T-476 it crashed when the target existed and was lost when it didn't). On remove a relationship may be left out (#175).
  */
 function checkLinkEntries(links: unknown, field: string, index?: number, needsRelationship = true): void {
   if (links === undefined || links === null) return;
@@ -199,7 +199,8 @@ function checkLinkEntries(links: unknown, field: string, index?: number, needsRe
     }
     const rel = link.relationship;
     if (needsRelationship ? !isNameString(rel) : rel !== undefined && rel !== null && typeof rel !== "string") {
-      throw shapeError(`${field}.${i}.relationship`, `\`${field}[${i}].relationship\` is required: what the link means.`, '"relationship": "mentions" (any word: "related", "about", "parent")', index);
+      const what = needsRelationship ? "is required: what the link means." : "must be a string.";
+      throw shapeError(`${field}.${i}.relationship`, `\`${field}[${i}].relationship\` ${what}`, '"relationship": "mentions" (any word: "related", "about", "parent")', index);
     }
   });
 }

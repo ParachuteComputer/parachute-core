@@ -132,13 +132,15 @@ describe("update-record's links.add", () => {
     expect(r.wire).toMatchObject({ error_type: "invalid_query", field: "links.add.0.relationship", index: 1 });
     expect(((await v.call("query-records", { id: "A" })) as { body: string }).body).toBe("a");
   });
-  test("links.remove: a string entry is refused; no relationship is fine (it removes by target, as before)", async () => {
+  test("links.remove: a string entry is refused; an entry without a relationship is still accepted", async () => {
     const v = vault();
     await v.call("create-record", { path: "A", body: "a" });
     await v.call("create-record", { path: "B", body: "b", links: [{ target: "A", relationship: "r" }] });
     const r = await refusal(v.call("update-record", { id: "B", force: true, links: { remove: ["A"] } }));
     expect(r).toMatchObject({ class: "Error", error_type: "invalid_query", field: "links.remove.0" });
     await v.call("update-record", { id: "B", force: true, links: { remove: [{ target: "A" }] } });
+    const r2 = await refusal(v.call("update-record", { id: "B", force: true, links: { remove: [{ target: "A", relationship: 5 }] } }));
+    expect(r2.message).toBe("`links.remove[0].relationship` must be a string.");
   });
   test("a string entry is refused", async () => {
     const v = vault();
