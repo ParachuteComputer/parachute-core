@@ -130,12 +130,15 @@ describe("MCP tool crash → one server log line (audit L6-02)", () => {
   }, E2E_TIMEOUT);
 
   test("a crash in a write tool logs one line, and the argument values never reach the log", async () => {
+    expect((await callTool("create-note", { content: "x", path: `p/${MARKER}` })).result?.isError).toBeFalsy();
     const from = output.length;
-    const body = await callTool("create-note", { content: MARKER, path: `p/${MARKER}`, tags: { a: MARKER } });
+    // update-note with metadata null still throws a real TypeError (#175). create-note's tags as an object did until
+    // #173, which refuses wrong create shapes before writing.
+    const body = await callTool("update-note", { id: `p/${MARKER}`, content: MARKER, metadata: null, force: true });
     expect(body.result?.isError).toBe(true);
     const lines = await crashLinesSince(from, 1);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("tool=create-note");
+    expect(lines[0]).toContain("tool=update-note");
     expect(lines[0]).toContain("class=TypeError");
     expect(output).not.toContain(MARKER);
   }, E2E_TIMEOUT);

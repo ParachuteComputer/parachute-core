@@ -72,7 +72,7 @@ type Tagged = {
   expected_from?: unknown; to?: unknown; current?: unknown; violations?: unknown; got?: unknown; unused?: unknown;
   fields?: unknown; hint?: string; path?: string; candidates?: unknown; extension?: string; reason?: string;
   limit?: number; tag?: string; cycle?: unknown; how_to?: string; size?: number; max_bytes?: number; mime_type?: string;
-  done?: unknown; failed?: unknown; missing?: unknown;
+  done?: unknown; failed?: unknown; missing?: unknown; index?: number;
   /** An `McpError` already formed (a door's own, or one passed through): its `data`. */
   data?: unknown;
 };
@@ -91,7 +91,8 @@ export function refusalOfError(err: unknown): McpRefusal | null {
     const { error_type, ...rest } = e.data;
     return refusal(error_type as string, message, rest);
   }
-  if (e.error_type === "invalid_query") return refusal("invalid_query", message, { field: e.field, got: e.got, hint: e.hint, how_to: e.how_to });
+  // index: which item of a batch (create-note's shape check, T-476)
+  if (e.error_type === "invalid_query") return refusal("invalid_query", message, { field: e.field, got: e.got, hint: e.hint, how_to: e.how_to, index: e.index });
   if (e.error_type === "invalid_search_syntax") return refusal("invalid_search_syntax", message, { field: e.field, got: e.got, hint: e.hint });
   if (e.code === "CONFLICT") {
     return refusal("conflict", message, {
