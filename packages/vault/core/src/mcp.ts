@@ -166,6 +166,67 @@ function structuredError(
   return Object.assign(new Error(message), fields);
 }
 
+const isPlainObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+const isNameString = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
+
+/**
+ * A wrongly shaped argument refused before anything is written (T-476). Each shape here used to reach string or
+ * array code and throw a TypeError (`path.replace is not a function`), which a door counts as a server fault; a
+ * single create had often already written its note by then, so the caller saw an error for a write that happened.
+ * `index` names the batch item. Messages say `content` / `metadata` / `notes` so the record door words them.
+ */
+function shapeError(field: string, message: string, hint: string, index?: number): Error {
+  const where = index === undefined ? "" : `In item ${index} of \`notes\`: `;
+  return structuredError(where + message, { error_type: "invalid_query", field, hint, ...(index === undefined ? {} : { index }) });
+}
+
+/**
+ * Structured links (`links` on create, `links.add` on update): each `{target, relationship}` with both a non-empty
+ * string. The relationship has no default: a link without one is refused (before T-476 it crashed when the target
+ * existed and was lost when it didn't).
+ */
+function checkLinkEntries(links: unknown, field: string, index?: number): void {
+  if (links === undefined || links === null) return;
+  if (!Array.isArray(links)) {
+    throw shapeError(field, `\`${field}\` must be an array of {target, relationship}.`, '[{"target": "People/Ada", "relationship": "mentions"}]', index);
+  }
+  links.forEach((link, i) => {
+    if (!isPlainObject(link)) {
+      throw shapeError(`${field}.${i}`, `\`${field}[${i}]\` must be an object {target, relationship}.`, '{"target": "People/Ada", "relationship": "mentions"}', index);
+    }
+    if (!isNameString(link.target)) {
+      throw shapeError(`${field}.${i}.target`, `\`${field}[${i}].target\` must be a record's path, title or id.`, '"target": "People/Ada"', index);
+    }
+    if (!isNameString(link.relationship)) {
+      throw shapeError(`${field}.${i}.relationship`, `\`${field}[${i}].relationship\` is required: what the link means.`, '"relationship": "mentions" (any word: "related", "about", "parent")', index);
+    }
+  });
+}
+
+/** create-note's arguments, every item, before any write (T-476): what the tool would otherwise crash on. */
+function checkCreateShapes(batch: unknown, items: unknown[]): void {
+  if (batch !== undefined && batch !== null && !Array.isArray(batch)) {
+    throw shapeError("notes", "`notes` must be an array of notes.", 'notes: [{"path": "Notes/A", "content": "..."}]');
+  }
+  const batched = Array.isArray(batch);
+  items.forEach((raw, n) => {
+    const index = batched ? n : undefined;
+    if (!isPlainObject(raw)) throw shapeError("notes", "Each entry in `notes` must be an object.", '{"path": "Notes/A", "content": "..."}', index);
+    const item = raw;
+    for (const key of ["path", "content", "created_at"] as const) {
+      const v = item[key];
+      if (v !== undefined && v !== null && typeof v !== "string") {
+        throw shapeError(key, `\`${key}\` must be a string.`, key === "created_at" ? "an ISO-8601 timestamp" : key === "path" ? '"Notes/A"' : "the text, as one string", index);
+      }
+    }
+    const tags = item.tags;
+    if (tags !== undefined && tags !== null && (!Array.isArray(tags) || tags.some((t) => typeof t !== "string"))) {
+      throw shapeError("tags", "`tags` must be an array of names.", '["garden", "idea"]', index);
+    }
+    checkLinkEntries(item.links, "links", index);
+  });
+}
+
 /**
  * query-notes' `since`: what changed since then, so edits to older notes count.
  * It becomes a `date_filter` on `updated_at`, so every path through the tool
@@ -1649,6 +1710,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         if (items.length > MAX_BATCH_SIZE) {
           throw new BatchTooLargeError(items.length);
         }
+        checkCreateShapes(batch, items);
 
         const created: Note[] = [];
         // Structured `links` are resolved in a SECOND pass, after every
@@ -1738,8 +1800,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // existing values. See the tool description for the full contract.
           const updates: { content?: string; metadata?: Record<string, unknown> } = {};
           if (mode === "update") {
-            if (item.content !== undefined) updates.content = item.content as string;
-            if (item.metadata !== undefined) {
+            // null is an optional the caller isn't using (T-476: it crashed here).
+            if (item.content != null) updates.content = item.content as string;
+            if (item.metadata != null) {
               updates.metadata = noteOps.mergeMetadata(
                 existingNote.metadata as Record<string, unknown> | null | undefined,
                 item.metadata as Record<string, unknown>,
@@ -2059,6 +2122,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             });
           }
         }
+        // T-476: a `links.add` entry without a relationship (or a string where an object goes) crashed mid-write.
+        items.forEach((item: any, n: number) => {
+          if (isPlainObject(item?.links)) checkLinkEntries(item.links.add, "links.add", batch ? n : undefined);
+        });
 
         if (items.length > MAX_BATCH_SIZE) {
           throw new BatchTooLargeError(items.length);
