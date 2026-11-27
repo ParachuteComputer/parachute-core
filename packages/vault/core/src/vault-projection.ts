@@ -381,14 +381,17 @@ export const SKILLS_LINE =
   "with a `description`; before a task a description matches, read that skill in full and follow it.";
 
 /**
- * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
+ * How to build a live page on this vault (T-476: how a page refreshes was measured in the real claude.ai on
+ * 2026-11-27, artifact runtime contract 0.2.99; pull request #172). The brief has an 800-token budget
+ * (contracts/suites/mcp/budget.test.ts) with little room left, so this line names only the interval; why, the
+ * Updated line, the Refresh and how a refusal reaches a page are in the skill. In
  * record words: every door that sends this brief lists the record tools. The reply shapes and a record's keys are in
  * query-records' own description; the long form is the docs page it names and the `live-page` skill.
  */
 export const LIVE_PAGE_BLOCK =
-  "A Claude artifact reads with `watchTool` on `query-records` and writes on a click with `update-record` " +
-  "(`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again; a refusal is `isError`. Guide: " +
-  "https://parachute.computer/docs/use/claude-artifacts/";
+  "A Claude artifact reads with `watchTool` on `query-records` (options `{ refetchInterval: 30000 }`) and writes on a " +
+  "click with `update-record` (`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again. " +
+  "Guide: https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
   vaultName: string;

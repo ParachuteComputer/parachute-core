@@ -29,6 +29,12 @@ its manifest names. An applet you didn't approve, or one whose code changed sinc
 `isError` with `structuredContent {error_type, message, …}`. Hosts such as Claude's artifacts now see the vault's own
 words instead of a generic error. Clients that read the old JSON-RPC error should read the result (T-476).
 
+**Live pages stay current.** The `live-page` skill now tells an AI to build a page that reads again every 30 seconds
+while it is on screen (`refetchInterval: 30000`, claude.ai's shortest), shows when it last read, and has a Refresh;
+the brief's live-pages line names the interval. Measured in claude.ai: a page with no interval reads only when it
+opens and when it calls `invalidate`; one with an interval pauses while hidden and catches up in about a second on
+return. Before, Claude chose 60 seconds on its own (T-476).
+
 ## 0.9.0-pre.2
 
 No schema number moves (hub.db stays 24): going back to 0.9.0-pre.1 is code-only (docs/UPGRADE-0.9.md). On the way
