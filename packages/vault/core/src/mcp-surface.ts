@@ -36,6 +36,7 @@ import { refuseTypesInTags } from "./tag-kind.js";
 import { stripTagHash } from "./tag-hierarchy.js";
 import { stampTypeCreator, typeIsUndefined, writeTypeProblem, type TypeWriter } from "./type-write.js";
 import { capVaultInfoTags } from "./vault-projection.js";
+import { buildDocsTool, DOCS_DESCRIPTION, DOCS_INPUT_SCHEMA, type DocsToolOpts } from "./docs-tool.js";
 
 export type Verb = "read" | "write" | "admin";
 
@@ -67,6 +68,9 @@ export interface RecordSurfaceOpts {
   /** The caller's write stamp (`by`, `via`), as its record writes carry it. A type it defines records it, and write
    *  access may add fields to a type whose stamp is its own (type-write.ts). Omitted: nothing is recorded. */
   writer?: TypeWriter;
+  /** Where `docs` reads its pages and for which version (docs-tool.ts, T-476). Omitted or `null`: no `docs` tool (a
+   *  door says where its docs are, so an operator's `off` can't be skipped by a door that forgot to pass it). */
+  docs?: DocsToolOpts | null;
 }
 
 const VERB_RANK: Record<Verb, number> = { read: 0, write: 1, admin: 2 };
@@ -84,7 +88,10 @@ export function shapeRecordSurface(tools: McpToolDef[], opts: RecordSurfaceOpts)
     const visible = opts.tagVisible ? await opts.tagVisible() : undefined;
     refuseTypesInTags(opts.db, call, tool === "create-record" ? "create" : "update", visible);
   };
-  const shaped = byToolOrder(addRecordTools(applyElevenTools(tools, opts), opts.onUse, recordCheck));
+  const surface = addRecordTools(applyElevenTools(tools, opts), opts.onUse, recordCheck);
+  // T-476: Parachute's docs for this version, from the docs site, in place of the guides once seeded into each vault.
+  if (opts.docs) surface.push(buildDocsTool(opts.docs));
+  const shaped = byToolOrder(surface);
   applyVaultInfoHelp(shaped, opts);
   applyParamTeaching(shaped, opts);
   return shaped;
@@ -119,6 +126,7 @@ export function toolHelp(name: string, toolNames: readonly string[], doorTool?: 
       ),
     };
   }
+  if (name === "docs" && toolNames.includes("docs")) return { tool: name, description: DOCS_DESCRIPTION, parameters: DOCS_INPUT_SCHEMA };
   const ref = doorTool?.(name) ?? MCP_TOOL_REFERENCE.find((e) => e.name === name);
   if (!ref) {
     throw Object.assign(new Error(`No tool named "${name}". Tools: ${toolNames.join(", ")}.`), {
@@ -174,7 +182,10 @@ function applyElevenTools(tools: McpToolDef[], opts: RecordSurfaceOpts): McpTool
           }
           if (!writeMay || problem) {
             const why = problem ? ` ${problem.message}` : name === "manage-types" && opts.hasVerb("write") ? " With write access you can make a new type, and add fields to a type you made (action update)." : "";
-            throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.${why}`);
+            // A refusal the person can fix (T-476: the needs-admin page and their step ride on it), never a crash.
+            throw Object.assign(new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.${why}`), {
+              error_type: "insufficient_scope",
+            });
           }
         }
         if (typeName !== null) {

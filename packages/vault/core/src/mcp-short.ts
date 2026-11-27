@@ -48,7 +48,9 @@ const PATH_BETWEEN_REF: Schema = {
 
 const LINKS = {
   type: "array",
-  items: obj({ target: str("Note path or id"), relationship: str() }, ["target"]),
+  // T-476: both required. The engine refuses a link without a relationship (it never worked: a crash when the target
+  // existed, lost when it didn't); the full reference already said so.
+  items: obj({ target: str("Note path or id"), relationship: str() }, ["target", "relationship"]),
 };
 
 /** A type's field options, in its own schema (0.9.2: an AI that doesn't ask for help still sees all of them). */
@@ -147,7 +149,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
         metadata: { type: "object" },
         tags: obj({ add: { type: "array", items: { type: "string" } }, remove: { type: "array", items: { type: "string" } } }),
         types: { type: "object", description: "{add, remove}, as tags" },
-        links: { type: "object", description: "{add: [{target, relationship?}], remove: [...]}" },
+        links: { type: "object", description: "{add: [{target, relationship}], remove: [...]}" },
         path: str("Rename to"),
         if_updated_at: str(),
         force: bool(),
@@ -462,12 +464,12 @@ export const TOOL_ALIASES: Record<string, string> = {
 
 /** An alias's description: the one deprecation line, then nothing else (the schema stays as it was). */
 export function aliasDescription(tool: string): string {
-  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}. Same parameters as before.`;
+  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}.`;
 }
 
 /** The order tools/list sends: the eleven (record tools first, T-407), then the aliases, note-named ones first. */
 export const TOOL_ORDER = [
-  "query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor",
+  "query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "docs", "doctor",
   "read-attachment", "add-attachment", "attachment-url", "manage-types", "manage-keys",
   "query-notes", "create-note", "update-note", "delete-note", "list-tags",
   ...Object.keys(TOOL_ALIASES),

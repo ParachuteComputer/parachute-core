@@ -26,9 +26,9 @@
 {"key":"account/vaults.item.url","value":"string"}
 {"key":"account/vaults.item.version","value":"string"}
 {"key":"account/vaults.reply.envelope","value":["vaults"]}
-{"key":"annotations/account.read-only.tools","value":["doctor","find-path","list-access","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download"]}
+{"key":"annotations/account.read-only.tools","value":["docs","doctor","find-path","list-access","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download"]}
 {"key":"annotations/destructive.tools","value":["add-attachment","create-note","create-record","delete-note","delete-record","delete-tag","manage-keys","manage-token","manage-types","merge-tags","prune-schema","rename-tag","update-note","update-record","update-tag","vault-info"]}
-{"key":"annotations/read-only.tools","value":["attachment-url","doctor","find-path","list-tags","list-types","query-notes","query-records","read-attachment","request-attachment-download","vault-info"]}
+{"key":"annotations/read-only.tools","value":["attachment-url","docs","doctor","find-path","list-tags","list-types","query-notes","query-records","read-attachment","request-attachment-download","vault-info"]}
 {"key":"connect/admin-scope","value":{"granted":"admin read write"}}
 {"key":"connect/admin-scope.advertised","value":false}
 {"key":"connect/admin-scope.as-drawn","value":"read write"}
@@ -55,6 +55,7 @@
 {"key":"connect/token.lifetime","value":900}
 {"key":"connect/token.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
 {"key":"connect/written-by.stamp","value":{"by":"string","via":"key:<client>"}}
+{"key":"docs/brief-line","value":"Docs for Parachute <version>: `docs {search}`, `docs {topic}`; a refusal's `docs` is its fix page."}
 {"key":"exit/export-key.headers","value":{"type":"application/x-tar"}}
 {"key":"exit/export-key.mcp-refusal","value":{"status":403}}
 {"key":"exit/export-key.mint.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"null","name":"string","revoked_at":"null","scopes":["string"],"status":"string","token":"string","vault":"string"}}
@@ -132,9 +133,9 @@
 {"key":"links/link.shape","value":{"createdAt":"string","relationship":"string","sourceId":"string","sourceNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"},"targetId":"string","targetNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"}}}
 {"key":"links/unresolved.warning","value":[{"code":"string","message":"string","relationship":"string","target":"string"}]}
 {"key":"mcp/admin.capabilities","value":["resources","tools"]}
-{"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
+{"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Attachments","Live pages (Claude artifacts)","Scripts"]}
 {"key":"mcp/admin.server.name","value":"parachute-vault/<v>"}
-{"key":"mcp/admin.tool-count","value":26}
+{"key":"mcp/admin.tool-count","value":27}
 {"key":"mcp/admin.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.add-attachment.present","value":true}
 {"key":"mcp/admin.tool.add-attachment.schema","value":"57a4ad1fb87584f3"}
@@ -146,15 +147,15 @@
 {"key":"mcp/admin.tool.create-note.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.create-note.present","value":true}
 {"key":"mcp/admin.tool.create-note.schema","value":"6959ce1ef7951c85"}
-{"key":"mcp/admin.tool.create-note.words","value":"82e86d68d2cf39cc"}
+{"key":"mcp/admin.tool.create-note.words","value":"c7a3d13f388b612d"}
 {"key":"mcp/admin.tool.create-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.create-record.present","value":true}
-{"key":"mcp/admin.tool.create-record.schema","value":"a622c4d624114f3f"}
+{"key":"mcp/admin.tool.create-record.schema","value":"e0b35144e50d3452"}
 {"key":"mcp/admin.tool.create-record.words","value":"8c786f200d2b1c15"}
 {"key":"mcp/admin.tool.delete-note.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.delete-note.present","value":true}
 {"key":"mcp/admin.tool.delete-note.schema","value":"2656caccbe8c4d2b"}
-{"key":"mcp/admin.tool.delete-note.words","value":"42869e1ca159ae75"}
+{"key":"mcp/admin.tool.delete-note.words","value":"2413c995a101e2aa"}
 {"key":"mcp/admin.tool.delete-record.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.delete-record.present","value":true}
 {"key":"mcp/admin.tool.delete-record.schema","value":"2656caccbe8c4d2b"}
@@ -162,7 +163,11 @@
 {"key":"mcp/admin.tool.delete-tag.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.delete-tag.present","value":true}
 {"key":"mcp/admin.tool.delete-tag.schema","value":"cd73381db2de3295"}
-{"key":"mcp/admin.tool.delete-tag.words","value":"d99951ae9d44facc"}
+{"key":"mcp/admin.tool.delete-tag.words","value":"e41c936afc6cc259"}
+{"key":"mcp/admin.tool.docs.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":true,"readOnlyHint":true}}
+{"key":"mcp/admin.tool.docs.present","value":true}
+{"key":"mcp/admin.tool.docs.schema","value":"7e3411fe7a464e23"}
+{"key":"mcp/admin.tool.docs.words","value":"76d68ef3aea92055"}
 {"key":"mcp/admin.tool.doctor.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.doctor.present","value":true}
 {"key":"mcp/admin.tool.doctor.schema","value":"be7c2882c96356b3"}
@@ -170,11 +175,11 @@
 {"key":"mcp/admin.tool.find-path.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.find-path.present","value":true}
 {"key":"mcp/admin.tool.find-path.schema","value":"9067a8cde9db075a"}
-{"key":"mcp/admin.tool.find-path.words","value":"24e1390cbe5afdfa"}
+{"key":"mcp/admin.tool.find-path.words","value":"955bc40e10e0dd8d"}
 {"key":"mcp/admin.tool.list-tags.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.list-tags.present","value":true}
 {"key":"mcp/admin.tool.list-tags.schema","value":"f7bed7385a39f6ca"}
-{"key":"mcp/admin.tool.list-tags.words","value":"4a2dd24c6d77764c"}
+{"key":"mcp/admin.tool.list-tags.words","value":"1cbc254a61400d75"}
 {"key":"mcp/admin.tool.list-types.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.list-types.present","value":true}
 {"key":"mcp/admin.tool.list-types.schema","value":"cad3bd365285cdbc"}
@@ -186,7 +191,7 @@
 {"key":"mcp/admin.tool.manage-token.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.manage-token.present","value":true}
 {"key":"mcp/admin.tool.manage-token.schema","value":"64e302cdc4abf04d"}
-{"key":"mcp/admin.tool.manage-token.words","value":"1b73e2c7a3571c44"}
+{"key":"mcp/admin.tool.manage-token.words","value":"fd0e248ccb987768"}
 {"key":"mcp/admin.tool.manage-types.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.manage-types.present","value":true}
 {"key":"mcp/admin.tool.manage-types.schema","value":"a23cacde509d9a91"}
@@ -194,15 +199,15 @@
 {"key":"mcp/admin.tool.merge-tags.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.merge-tags.present","value":true}
 {"key":"mcp/admin.tool.merge-tags.schema","value":"17e70757685c08b1"}
-{"key":"mcp/admin.tool.merge-tags.words","value":"fb7539c7efcbd54f"}
+{"key":"mcp/admin.tool.merge-tags.words","value":"429334bfb520211c"}
 {"key":"mcp/admin.tool.prune-schema.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.prune-schema.present","value":true}
 {"key":"mcp/admin.tool.prune-schema.schema","value":"6ea05ec1efe9a075"}
-{"key":"mcp/admin.tool.prune-schema.words","value":"b6f951d0545b4847"}
+{"key":"mcp/admin.tool.prune-schema.words","value":"0cec33d777cda665"}
 {"key":"mcp/admin.tool.query-notes.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.query-notes.present","value":true}
 {"key":"mcp/admin.tool.query-notes.schema","value":"5a7f80c4914c713f"}
-{"key":"mcp/admin.tool.query-notes.words","value":"8b6c408e946520e0"}
+{"key":"mcp/admin.tool.query-notes.words","value":"c23b0589544d1453"}
 {"key":"mcp/admin.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.query-records.present","value":true}
 {"key":"mcp/admin.tool.query-records.schema","value":"3c2863cbe1b9829b"}
@@ -214,27 +219,27 @@
 {"key":"mcp/admin.tool.rename-tag.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.rename-tag.present","value":true}
 {"key":"mcp/admin.tool.rename-tag.schema","value":"c7668d8995009ba2"}
-{"key":"mcp/admin.tool.rename-tag.words","value":"94362aba41a60f53"}
+{"key":"mcp/admin.tool.rename-tag.words","value":"af56666801381b61"}
 {"key":"mcp/admin.tool.request-attachment-download.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.request-attachment-download.present","value":true}
 {"key":"mcp/admin.tool.request-attachment-download.schema","value":"159f5180c1009931"}
-{"key":"mcp/admin.tool.request-attachment-download.words","value":"7600547c351128b2"}
+{"key":"mcp/admin.tool.request-attachment-download.words","value":"989eea776bc0fac1"}
 {"key":"mcp/admin.tool.request-attachment-upload.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.request-attachment-upload.present","value":true}
 {"key":"mcp/admin.tool.request-attachment-upload.schema","value":"3d376f61fa6b1f09"}
-{"key":"mcp/admin.tool.request-attachment-upload.words","value":"564d345ff4e5e0f9"}
+{"key":"mcp/admin.tool.request-attachment-upload.words","value":"25fd34ae86ee8b1a"}
 {"key":"mcp/admin.tool.update-note.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-note.present","value":true}
 {"key":"mcp/admin.tool.update-note.schema","value":"f7057f0c2b8c5042"}
-{"key":"mcp/admin.tool.update-note.words","value":"71c42771f2bf1ad3"}
+{"key":"mcp/admin.tool.update-note.words","value":"3a6edfe93de8d847"}
 {"key":"mcp/admin.tool.update-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-record.present","value":true}
-{"key":"mcp/admin.tool.update-record.schema","value":"1e39438587b403ef"}
+{"key":"mcp/admin.tool.update-record.schema","value":"1bf05bb80b0b64fd"}
 {"key":"mcp/admin.tool.update-record.words","value":"e43c54902d4f5b03"}
 {"key":"mcp/admin.tool.update-tag.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-tag.present","value":true}
 {"key":"mcp/admin.tool.update-tag.schema","value":"ca7b0b3fc10294db"}
-{"key":"mcp/admin.tool.update-tag.words","value":"ea819175d0c1a284"}
+{"key":"mcp/admin.tool.update-tag.words","value":"a8f98f0ec27ac93c"}
 {"key":"mcp/admin.tool.vault-info.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.vault-info.present","value":true}
 {"key":"mcp/admin.tool.vault-info.schema","value":"530ff43b9f863786"}
@@ -263,20 +268,24 @@
 {"key":"mcp/protected-resource.keys","value":["authorization_servers","bearer_methods_supported","resource","scopes_supported"]}
 {"key":"mcp/protected-resource.resource","value":"string"}
 {"key":"mcp/protected-resource.scopes_supported","value":["string"]}
-{"key":"mcp/query-notes.no-such-note","value":{"isError":true,"keys":["error_type","id","message"],"type":"not_found"}}
+{"key":"mcp/query-notes.no-such-note","value":{"isError":true,"keys":["docs","error_type","id","message"],"type":"not_found"}}
 {"key":"mcp/query-notes.result.shape","value":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","preview":"string","score":"number","tags":["string"],"types":[],"updatedAt":"string"}]}
 {"key":"mcp/reach.admin","value":"This connection can read the whole vault, create, change and delete its records, and manage its types, settings and keys."}
 {"key":"mcp/reach.read","value":"This connection can read the whole vault. It can't change anything."}
 {"key":"mcp/reach.write","value":"This connection can read the whole vault, and create, change and delete its records."}
 {"key":"mcp/read-calls-write-tool","value":"no such tool"}
 {"key":"mcp/read.capabilities","value":["resources","tools"]}
-{"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
+{"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Attachments","Live pages (Claude artifacts)","Scripts"]}
 {"key":"mcp/read.server.name","value":"parachute-vault/<v>"}
-{"key":"mcp/read.tool-count","value":10}
+{"key":"mcp/read.tool-count","value":11}
 {"key":"mcp/read.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.attachment-url.present","value":true}
 {"key":"mcp/read.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
 {"key":"mcp/read.tool.attachment-url.words","value":"a8d05ae38c978ecd"}
+{"key":"mcp/read.tool.docs.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":true,"readOnlyHint":true}}
+{"key":"mcp/read.tool.docs.present","value":true}
+{"key":"mcp/read.tool.docs.schema","value":"7e3411fe7a464e23"}
+{"key":"mcp/read.tool.docs.words","value":"76d68ef3aea92055"}
 {"key":"mcp/read.tool.doctor.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.doctor.present","value":true}
 {"key":"mcp/read.tool.doctor.schema","value":"be7c2882c96356b3"}
@@ -284,11 +293,11 @@
 {"key":"mcp/read.tool.find-path.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.find-path.present","value":true}
 {"key":"mcp/read.tool.find-path.schema","value":"9067a8cde9db075a"}
-{"key":"mcp/read.tool.find-path.words","value":"24e1390cbe5afdfa"}
+{"key":"mcp/read.tool.find-path.words","value":"955bc40e10e0dd8d"}
 {"key":"mcp/read.tool.list-tags.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.list-tags.present","value":true}
 {"key":"mcp/read.tool.list-tags.schema","value":"f7bed7385a39f6ca"}
-{"key":"mcp/read.tool.list-tags.words","value":"4a2dd24c6d77764c"}
+{"key":"mcp/read.tool.list-tags.words","value":"1cbc254a61400d75"}
 {"key":"mcp/read.tool.list-types.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.list-types.present","value":true}
 {"key":"mcp/read.tool.list-types.schema","value":"cad3bd365285cdbc"}
@@ -296,7 +305,7 @@
 {"key":"mcp/read.tool.query-notes.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.query-notes.present","value":true}
 {"key":"mcp/read.tool.query-notes.schema","value":"5a7f80c4914c713f"}
-{"key":"mcp/read.tool.query-notes.words","value":"8b6c408e946520e0"}
+{"key":"mcp/read.tool.query-notes.words","value":"c23b0589544d1453"}
 {"key":"mcp/read.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.query-records.present","value":true}
 {"key":"mcp/read.tool.query-records.schema","value":"3c2863cbe1b9829b"}
@@ -308,15 +317,15 @@
 {"key":"mcp/read.tool.request-attachment-download.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.request-attachment-download.present","value":true}
 {"key":"mcp/read.tool.request-attachment-download.schema","value":"159f5180c1009931"}
-{"key":"mcp/read.tool.request-attachment-download.words","value":"7600547c351128b2"}
+{"key":"mcp/read.tool.request-attachment-download.words","value":"989eea776bc0fac1"}
 {"key":"mcp/read.tool.vault-info.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.vault-info.present","value":true}
 {"key":"mcp/read.tool.vault-info.schema","value":"530ff43b9f863786"}
 {"key":"mcp/read.tool.vault-info.words","value":"dee3e40876423132"}
-{"key":"mcp/refusal.blind-update","value":{"hint":"4173c86cffc0aa4a","isError":true,"keys":["error_type","hint","message","note_id","path"],"type":"precondition_required"}}
+{"key":"mcp/refusal.blind-update","value":{"hint":"4173c86cffc0aa4a","isError":true,"keys":["docs","error_type","hint","message","note_id","path"],"type":"precondition_required"}}
 {"key":"mcp/refusal.message-is-plain","value":true}
-{"key":"mcp/refusal.path-taken","value":{"isError":true,"keys":["error_type","message","path"],"type":"path_conflict"}}
-{"key":"mcp/refusal.unknown-tool","value":{"isError":true,"keys":["error_type","message","tool"],"type":"unknown_tool"}}
+{"key":"mcp/refusal.path-taken","value":{"isError":true,"keys":["docs","error_type","message","path"],"type":"path_conflict"}}
+{"key":"mcp/refusal.unknown-tool","value":{"isError":true,"keys":["docs","error_type","message","tool"],"type":"unknown_tool"}}
 {"key":"mcp/root.cold","value":{"challenge":"Bearer resource_metadata=\"…\"","status":401}}
 {"key":"mcp/root.connect","value":"connected"}
 {"key":"mcp/root.same-tools-as-the-vault","value":true}
@@ -329,9 +338,9 @@
 {"key":"mcp/update-note.result.shape","value":{"content":"string","created":"boolean","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","tags":["string"],"types":[],"updatedAt":"string"}}
 {"key":"mcp/vault-info.result.keys","value":["coordinates","description","getting_started","indexed_fields","map","name","query_hints","tags"]}
 {"key":"mcp/write.capabilities","value":["resources","tools"]}
-{"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
+{"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Attachments","Live pages (Claude artifacts)","Scripts"]}
 {"key":"mcp/write.server.name","value":"parachute-vault/<v>"}
-{"key":"mcp/write.tool-count","value":19}
+{"key":"mcp/write.tool-count","value":20}
 {"key":"mcp/write.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.add-attachment.present","value":true}
 {"key":"mcp/write.tool.add-attachment.schema","value":"57a4ad1fb87584f3"}
@@ -343,19 +352,23 @@
 {"key":"mcp/write.tool.create-note.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.create-note.present","value":true}
 {"key":"mcp/write.tool.create-note.schema","value":"6959ce1ef7951c85"}
-{"key":"mcp/write.tool.create-note.words","value":"82e86d68d2cf39cc"}
+{"key":"mcp/write.tool.create-note.words","value":"c7a3d13f388b612d"}
 {"key":"mcp/write.tool.create-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.create-record.present","value":true}
-{"key":"mcp/write.tool.create-record.schema","value":"a622c4d624114f3f"}
+{"key":"mcp/write.tool.create-record.schema","value":"e0b35144e50d3452"}
 {"key":"mcp/write.tool.create-record.words","value":"8c786f200d2b1c15"}
 {"key":"mcp/write.tool.delete-note.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.delete-note.present","value":true}
 {"key":"mcp/write.tool.delete-note.schema","value":"2656caccbe8c4d2b"}
-{"key":"mcp/write.tool.delete-note.words","value":"42869e1ca159ae75"}
+{"key":"mcp/write.tool.delete-note.words","value":"2413c995a101e2aa"}
 {"key":"mcp/write.tool.delete-record.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.delete-record.present","value":true}
 {"key":"mcp/write.tool.delete-record.schema","value":"2656caccbe8c4d2b"}
 {"key":"mcp/write.tool.delete-record.words","value":"0c9ad5a1f72c5345"}
+{"key":"mcp/write.tool.docs.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":true,"readOnlyHint":true}}
+{"key":"mcp/write.tool.docs.present","value":true}
+{"key":"mcp/write.tool.docs.schema","value":"7e3411fe7a464e23"}
+{"key":"mcp/write.tool.docs.words","value":"76d68ef3aea92055"}
 {"key":"mcp/write.tool.doctor.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.doctor.present","value":true}
 {"key":"mcp/write.tool.doctor.schema","value":"be7c2882c96356b3"}
@@ -363,11 +376,11 @@
 {"key":"mcp/write.tool.find-path.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.find-path.present","value":true}
 {"key":"mcp/write.tool.find-path.schema","value":"9067a8cde9db075a"}
-{"key":"mcp/write.tool.find-path.words","value":"24e1390cbe5afdfa"}
+{"key":"mcp/write.tool.find-path.words","value":"955bc40e10e0dd8d"}
 {"key":"mcp/write.tool.list-tags.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.list-tags.present","value":true}
 {"key":"mcp/write.tool.list-tags.schema","value":"f7bed7385a39f6ca"}
-{"key":"mcp/write.tool.list-tags.words","value":"4a2dd24c6d77764c"}
+{"key":"mcp/write.tool.list-tags.words","value":"1cbc254a61400d75"}
 {"key":"mcp/write.tool.list-types.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.list-types.present","value":true}
 {"key":"mcp/write.tool.list-types.schema","value":"cad3bd365285cdbc"}
@@ -379,7 +392,7 @@
 {"key":"mcp/write.tool.query-notes.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.query-notes.present","value":true}
 {"key":"mcp/write.tool.query-notes.schema","value":"5a7f80c4914c713f"}
-{"key":"mcp/write.tool.query-notes.words","value":"8b6c408e946520e0"}
+{"key":"mcp/write.tool.query-notes.words","value":"c23b0589544d1453"}
 {"key":"mcp/write.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.query-records.present","value":true}
 {"key":"mcp/write.tool.query-records.schema","value":"3c2863cbe1b9829b"}
@@ -391,18 +404,18 @@
 {"key":"mcp/write.tool.request-attachment-download.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.request-attachment-download.present","value":true}
 {"key":"mcp/write.tool.request-attachment-download.schema","value":"159f5180c1009931"}
-{"key":"mcp/write.tool.request-attachment-download.words","value":"7600547c351128b2"}
+{"key":"mcp/write.tool.request-attachment-download.words","value":"989eea776bc0fac1"}
 {"key":"mcp/write.tool.request-attachment-upload.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.request-attachment-upload.present","value":true}
 {"key":"mcp/write.tool.request-attachment-upload.schema","value":"3d376f61fa6b1f09"}
-{"key":"mcp/write.tool.request-attachment-upload.words","value":"564d345ff4e5e0f9"}
+{"key":"mcp/write.tool.request-attachment-upload.words","value":"25fd34ae86ee8b1a"}
 {"key":"mcp/write.tool.update-note.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.update-note.present","value":true}
 {"key":"mcp/write.tool.update-note.schema","value":"f7057f0c2b8c5042"}
-{"key":"mcp/write.tool.update-note.words","value":"71c42771f2bf1ad3"}
+{"key":"mcp/write.tool.update-note.words","value":"3a6edfe93de8d847"}
 {"key":"mcp/write.tool.update-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.update-record.present","value":true}
-{"key":"mcp/write.tool.update-record.schema","value":"1e39438587b403ef"}
+{"key":"mcp/write.tool.update-record.schema","value":"1bf05bb80b0b64fd"}
 {"key":"mcp/write.tool.update-record.words","value":"e43c54902d4f5b03"}
 {"key":"mcp/write.tool.vault-info.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.vault-info.present","value":true}
@@ -413,12 +426,12 @@
 {"key":"multivault/query.fan-out.keys","value":["results","vaults_queried"]}
 {"key":"multivault/refusals","value":[400,404,400]}
 {"key":"multivault/write-stamp.via","value":{"created":"key:<name>","revision":"key:<name>"}}
-{"key":"multivault/writer.tools","value":["attachment-url","create-note","create-record","delete-note","delete-record","doctor","find-path","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download","request-attachment-upload","update-note","update-record","vault-info"]}
+{"key":"multivault/writer.tools","value":["attachment-url","create-note","create-record","delete-note","delete-record","docs","doctor","find-path","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download","request-attachment-upload","update-note","update-record","vault-info"]}
 {"key":"records/mcp.create-record.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/mcp.list-types.shape","value":{"count":"number","created_at":"string","description":"null","expanded_count":"number","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
 {"key":"records/mcp.manage-types","value":{"created_at":"string","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","tag":"string","updated_at":"string"}}
 {"key":"records/mcp.old-word-beside-new","value":{"refused":true,"type":"invalid_query"}}
-{"key":"records/mcp.order","value":["query-records","create-record","update-record","delete-record","list-types","vault-info","doctor","read-attachment","add-attachment","attachment-url","manage-types","query-notes","create-note","update-note","delete-note","list-tags","find-path","update-tag","rename-tag","merge-tags","delete-tag","prune-schema","request-attachment-upload","request-attachment-download"]}
+{"key":"records/mcp.order","value":["query-records","create-record","update-record","delete-record","list-types","vault-info","docs","doctor","read-attachment","add-attachment","attachment-url","manage-types","query-notes","create-note","update-note","delete-note","list-tags","find-path","update-tag","rename-tag","merge-tags","delete-tag","prune-schema","request-attachment-upload","request-attachment-download"]}
 {"key":"records/mcp.query-records.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/rest.create.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"city":"string"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]},"warnings":"undefined"}}
 {"key":"records/rest.create.status","value":201}
@@ -426,16 +439,16 @@
 {"key":"records/rest.note-alias.says-leaving","value":{"body":false,"deprecation":"true"}}
 {"key":"records/rest.refusal.old-word-beside-new","value":{"error":"(text)","hint":"ba5bd279831f54a9","keys":["error","error_type","field","hint"],"status":400,"type":"invalid_query"}}
 {"key":"records/rest.type-in-tags","value":{"hint":"b594715fe960c66d","status":422,"type":"tag_kind"}}
-{"key":"refusals/above-level","value":{"keys":["error_type","message","tool"],"type":"unknown_tool"}}
+{"key":"refusals/above-level","value":{"keys":["docs","error_type","message","tool"],"type":"unknown_tool"}}
 {"key":"refusals/account.fan-out-row","value":["error","error_type","vault"]}
-{"key":"refusals/account.unknown-tool","value":{"keys":["error_type","message","tool"],"type":"unknown_tool"}}
-{"key":"refusals/blind-write","value":{"keys":["error_type","hint","message","note_id","path"],"type":"precondition_required"}}
-{"key":"refusals/conflict","value":{"keys":["current_updated_at","error_type","hint","message","path","record_id","your_updated_at"],"type":"conflict"}}
-{"key":"refusals/missing-note","value":{"keys":["error_type","id","message"],"type":"not_found"}}
-{"key":"refusals/missing-record","value":{"keys":["error_type","id","message"],"type":"not_found"}}
-{"key":"refusals/path-taken","value":{"keys":["error_type","message","path"],"type":"path_conflict"}}
-{"key":"refusals/unknown-parameter","value":{"keys":["error_type","field","hint","message"],"type":"unknown_parameter"}}
-{"key":"refusals/unknown-tool","value":{"keys":["error_type","message","tool"],"type":"unknown_tool"}}
+{"key":"refusals/account.unknown-tool","value":{"keys":["docs","error_type","message","tool"],"type":"unknown_tool"}}
+{"key":"refusals/blind-write","value":{"keys":["docs","error_type","hint","message","note_id","path"],"type":"precondition_required"}}
+{"key":"refusals/conflict","value":{"keys":["current_updated_at","docs","error_type","hint","message","path","record_id","your_updated_at"],"type":"conflict"}}
+{"key":"refusals/missing-note","value":{"keys":["docs","error_type","id","message"],"type":"not_found"}}
+{"key":"refusals/missing-record","value":{"keys":["docs","error_type","id","message"],"type":"not_found"}}
+{"key":"refusals/path-taken","value":{"keys":["docs","error_type","message","path"],"type":"path_conflict"}}
+{"key":"refusals/unknown-parameter","value":{"keys":["docs","error_type","field","hint","message"],"type":"unknown_parameter"}}
+{"key":"refusals/unknown-tool","value":{"keys":["docs","error_type","message","tool"],"type":"unknown_tool"}}
 {"key":"rest/cors.preflight","value":{"headers":["authorization","content-type","mcp-method","mcp-name","mcp-protocol-version","mcp-session-id","x-api-key"],"methods":["delete","get","options","patch","post","put"],"origin":"*","status":204}}
 {"key":"rest/cors.reply","value":{"origin":"*"}}
 {"key":"rest/cursor.page.shape","value":{"next_cursor":"string","notes":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","preview":"string","tags":[],"types":[],"updatedAt":"string"}]}}

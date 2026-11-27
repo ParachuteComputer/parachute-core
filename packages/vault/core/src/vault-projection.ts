@@ -33,6 +33,7 @@ import {
 } from "./tag-schemas.ts";
 import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
+import { docsBriefLine } from "./docs-tool.ts";
 import type { VaultStats, VaultMap } from "./types.ts";
 import { GETTING_STARTED_PATH } from "./seed-packs.ts";
 import { SKILL_TYPE } from "./skills.ts";
@@ -381,14 +382,17 @@ export const SKILLS_LINE =
   "with a `description`; before a task a description matches, read that skill in full and follow it.";
 
 /**
- * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
+ * How to build a live page on this vault (T-476: how a page refreshes was measured in the real claude.ai on
+ * 2026-11-27, artifact runtime contract 0.2.99; pull request #172). The brief has an 800-token budget
+ * (contracts/suites/mcp/budget.test.ts) with little room left, so this line names only the interval; why, the
+ * Updated line, the Refresh and how a refusal reaches a page are in the skill. In
  * record words: every door that sends this brief lists the record tools. The reply shapes and a record's keys are in
  * query-records' own description; the long form is the docs page it names and the `live-page` skill.
  */
 export const LIVE_PAGE_BLOCK =
-  "A Claude artifact reads with `watchTool` on `query-records` and writes on a click with `update-record` " +
-  "(`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again; a refusal is `isError`. Guide: " +
-  "https://parachute.computer/docs/use/claude-artifacts/";
+  "A Claude artifact reads with `watchTool` on `query-records` (options `{ refetchInterval: 30000 }`) and writes on a " +
+  "click with `update-record` (`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again. " +
+  "Guide: https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
   vaultName: string;
@@ -423,10 +427,13 @@ export function projectionToMarkdown(args: {
    */
   reach?: string;
   /**
-   * How this door's owner makes a key for a script, the line under "Scripting & automation". Omitted: a box's
+   * How this door's owner makes a key for a script, the line under "Scripts". Omitted: a box's
    * (`parachute auth mint-token`). A door without that command (cloud: keys are made in the account) says its own.
    */
   scripting?: string;
+  /** Where the docs are, the version this door runs and a newer release if the site says so (T-476, docs-tool.ts):
+   *  a line under the vault's name naming the `docs` tool. Omitted or `null`: no line (a door that lists no `docs` tool). */
+  docs?: { origin: string; version: string; newer?: string | null } | null;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
   const w = args.words ?? ((s: string) => s);
@@ -435,6 +442,8 @@ export function projectionToMarkdown(args: {
   const lines: string[] = [];
   lines.push(`You are connected to Parachute Vault "${vaultName}".`);
   if (args.reach) lines.push(args.reach);
+  // T-476: the docs for this version, and where a refusal's fix is: one line (docs-tool.ts docsBriefLine).
+  if (args.docs) lines.push(docsBriefLine(args.docs));
   // vault#669 / cloud#87 recovery: a non-string description (poisoned
   // via an unguarded write door) used to throw here (`description.trim
   // is not a function`) and take down MCP `initialize` — the first
@@ -571,10 +580,7 @@ export function projectionToMarkdown(args: {
   // T-476: one line, not the five hints (`vault-info` still returns them): query-records' own description, which
   // every client reads with the tool list, says each filter, so the brief keeps its budget for what only it can say.
   lines.push(w("`query-notes { type: \"X\" }` lists a type and its subtypes; the tool says every filter."));
-
-  lines.push("");
-  lines.push("## Refreshing context");
-  lines.push("");
+  // One line under Querying (T-476: the brief's 800 tokens), not a section of its own.
   lines.push("`vault-info` refreshes this; `vault-info { help: \"<tool>\" }` gives a tool's every parameter.");
 
   lines.push("");
@@ -587,7 +593,9 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push("## Live pages (Claude artifacts)");
   lines.push("");
-  lines.push(LIVE_PAGE_BLOCK);
+  // With the docs tool listed, a guide is a `docs` topic (T-476: shorter, and for this version); without it, the URL.
+  const guide = (topic: string) => (args.docs ? `\`docs {topic: "${topic}"}\`` : `https://parachute.computer/docs/${topic}/`);
+  lines.push(LIVE_PAGE_BLOCK.replace("https://parachute.computer/docs/use/claude-artifacts/", guide("use/claude-artifacts")));
 
   // Scripting pointer block: the connect-time brief used to dead-end on
   // querying — an agent had no path to "how do I script/automate against this
@@ -595,11 +603,11 @@ export function projectionToMarkdown(args: {
   // lean (token-budget note above). Uses the concrete vault name so the mint
   // command is copy-paste ready.
   lines.push("");
-  lines.push("## Scripting & automation (beyond this session)");
+  lines.push("## Scripts");
   lines.push("");
   lines.push(
     args.scripting ??
-      `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
+      `A script or cron job uses a key (\`parachute keys new <name> --vault ${vaultName} --can read\`) and the REST API (\`<hub-origin>/vault/${vaultName}/api/...\`); guide: ${guide("build/scripts")}`,
   );
 
   return lines.join("\n");

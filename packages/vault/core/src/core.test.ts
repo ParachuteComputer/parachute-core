@@ -9318,9 +9318,10 @@ describe("vault projection (vault#271)", async () => {
     // Scripting pointer (closes the "points nowhere" gap): the brief routes an
     // agent to the HTTP API + the public guide, with the vault name baked into
     // the copy-paste mint command.
-    expect(md).toContain("## Scripting & automation (beyond this session)");
-    expect(md).toContain("https://parachute.computer/scripting/");
-    expect(md).toContain("parachute auth mint-token --scope vault:test:read --ephemeral");
+    expect(md).toContain("## Scripts");
+    expect(md).toContain("https://parachute.computer/docs/build/scripts/");
+    // 0.9's command (T-476: `auth mint-token` is the 0.8 name, cli/src/front.ts)
+    expect(md).toContain("parachute keys new <name> --vault test --can read");
     expect(md).toContain("vault/test/api");
   });
 

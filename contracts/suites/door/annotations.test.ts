@@ -25,12 +25,13 @@ async function listed(level: "read" | "write" | "admin", opts: { url?: string; b
   }
 }
 
-/** Every tool carries the four hints as booleans, and none reaches past this door. */
+/** Every tool carries the four hints as booleans, and none reaches past this door but `docs`, which reads the docs site
+ *  (T-476) and says so. */
 function expectHints(where: string, tools: Tool[]) {
   for (const t of tools) {
     const a = t.annotations ?? {};
     expect({ where, tool: t.name, hints: HINTS.map((h) => typeof a[h]) }).toEqual({ where, tool: t.name, hints: HINTS.map(() => "boolean") });
-    expect({ where, tool: t.name, openWorld: a.openWorldHint }).toEqual({ where, tool: t.name, openWorld: false });
+    expect({ where, tool: t.name, openWorld: a.openWorldHint }).toEqual({ where, tool: t.name, openWorld: t.name === "docs" });
     // A read-only tool destroys nothing; a removal is destructive.
     if (a.readOnlyHint) expect({ tool: t.name, destructive: a.destructiveHint }).toEqual({ tool: t.name, destructive: false });
     if (/^delete-|^revoke-/.test(t.name)) expect({ tool: t.name, destructive: a.destructiveHint, readOnly: a.readOnlyHint }).toEqual({ tool: t.name, destructive: true, readOnly: false });

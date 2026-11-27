@@ -72,7 +72,7 @@ type Tagged = {
   expected_from?: unknown; to?: unknown; current?: unknown; violations?: unknown; got?: unknown; unused?: unknown;
   fields?: unknown; hint?: string; path?: string; candidates?: unknown; extension?: string; reason?: string;
   limit?: number; tag?: string; cycle?: unknown; how_to?: string; size?: number; max_bytes?: number; mime_type?: string;
-  done?: unknown; failed?: unknown; missing?: unknown;
+  done?: unknown; failed?: unknown; missing?: unknown; index?: number;
   /** An `McpError` already formed (a door's own, or one passed through): its `data`. */
   data?: unknown;
 };
@@ -91,7 +91,8 @@ export function refusalOfError(err: unknown): McpRefusal | null {
     const { error_type, ...rest } = e.data;
     return refusal(error_type as string, message, rest);
   }
-  if (e.error_type === "invalid_query") return refusal("invalid_query", message, { field: e.field, got: e.got, hint: e.hint, how_to: e.how_to });
+  // index: which item of a batch (create-note's shape check, T-476)
+  if (e.error_type === "invalid_query") return refusal("invalid_query", message, { field: e.field, got: e.got, hint: e.hint, how_to: e.how_to, index: e.index });
   if (e.error_type === "invalid_search_syntax") return refusal("invalid_search_syntax", message, { field: e.field, got: e.got, hint: e.hint });
   if (e.code === "CONFLICT") {
     return refusal("conflict", message, {
@@ -140,8 +141,20 @@ export function refusalOfError(err: unknown): McpRefusal | null {
   return null;
 }
 
-/** What a door answers for a tool it doesn't offer this caller (never saying whether it exists at another level). */
-export const unknownToolRefusal = (name: string): McpRefusal => refusal("unknown_tool", `Unknown tool: ${name}`, { tool: name });
+/** What a connection at each level is told it has, when it calls a tool it can't see (T-476). */
+const LEVEL_WORDS: Record<"read" | "write" | "admin", string> = {
+  read: "This connection can read; tools that write or need admin aren't listed for it.",
+  write: "This connection can read and write; tools that need admin aren't listed for it.",
+  admin: "tools/list names every tool this connection has.",
+};
+
+/**
+ * What a door answers for a tool it doesn't offer this caller. It never says whether the tool exists at another level
+ * (the same words for a tool above the caller and for none at all); given the caller's own `level`, it says what that
+ * level is, so an AI can tell the person "this needs admin" (T-476; the `docs` page says how the person grants it).
+ */
+export const unknownToolRefusal = (name: string, level?: "read" | "write" | "admin"): McpRefusal =>
+  refusal("unknown_tool", `Unknown tool: ${name}${level ? `. ${LEVEL_WORDS[level]}` : ""}`, { tool: name });
 
 /** What a door answers for an error nobody tagged: a crash, not a refusal; the door logs it (mcp-error-log.ts). */
 export const internalRefusal = (err: unknown): McpRefusal => refusal("internal_error", `Error: ${err instanceof Error ? err.message : "Unknown error"}`);
