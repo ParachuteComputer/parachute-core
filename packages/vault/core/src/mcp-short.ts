@@ -48,7 +48,9 @@ const PATH_BETWEEN_REF: Schema = {
 
 const LINKS = {
   type: "array",
-  items: obj({ target: str("Note path or id"), relationship: str() }, ["target"]),
+  // T-476: both required. The engine refuses a link without a relationship (it never worked: a crash when the target
+  // existed, lost when it didn't); the full reference already said so.
+  items: obj({ target: str("Note path or id"), relationship: str() }, ["target", "relationship"]),
 };
 
 /** A type's field options, in its own schema (0.9.2: an AI that doesn't ask for help still sees all of them). */
@@ -147,7 +149,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
         metadata: { type: "object" },
         tags: obj({ add: { type: "array", items: { type: "string" } }, remove: { type: "array", items: { type: "string" } } }),
         types: { type: "object", description: "{add, remove}, as tags" },
-        links: { type: "object", description: "{add: [{target, relationship?}], remove: [...]}" },
+        links: { type: "object", description: "{add: [{target, relationship}], remove: [...]}" },
         path: str("Rename to"),
         if_updated_at: str(),
         force: bool(),

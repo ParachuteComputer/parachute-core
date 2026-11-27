@@ -149,7 +149,7 @@
 {"key":"mcp/admin.tool.create-note.words","value":"82e86d68d2cf39cc"}
 {"key":"mcp/admin.tool.create-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.create-record.present","value":true}
-{"key":"mcp/admin.tool.create-record.schema","value":"a622c4d624114f3f"}
+{"key":"mcp/admin.tool.create-record.schema","value":"e0b35144e50d3452"}
 {"key":"mcp/admin.tool.create-record.words","value":"8c786f200d2b1c15"}
 {"key":"mcp/admin.tool.delete-note.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.delete-note.present","value":true}
@@ -229,7 +229,7 @@
 {"key":"mcp/admin.tool.update-note.words","value":"71c42771f2bf1ad3"}
 {"key":"mcp/admin.tool.update-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-record.present","value":true}
-{"key":"mcp/admin.tool.update-record.schema","value":"1e39438587b403ef"}
+{"key":"mcp/admin.tool.update-record.schema","value":"1bf05bb80b0b64fd"}
 {"key":"mcp/admin.tool.update-record.words","value":"e43c54902d4f5b03"}
 {"key":"mcp/admin.tool.update-tag.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.update-tag.present","value":true}
@@ -346,7 +346,7 @@
 {"key":"mcp/write.tool.create-note.words","value":"82e86d68d2cf39cc"}
 {"key":"mcp/write.tool.create-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.create-record.present","value":true}
-{"key":"mcp/write.tool.create-record.schema","value":"a622c4d624114f3f"}
+{"key":"mcp/write.tool.create-record.schema","value":"e0b35144e50d3452"}
 {"key":"mcp/write.tool.create-record.words","value":"8c786f200d2b1c15"}
 {"key":"mcp/write.tool.delete-note.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.delete-note.present","value":true}
@@ -402,7 +402,7 @@
 {"key":"mcp/write.tool.update-note.words","value":"71c42771f2bf1ad3"}
 {"key":"mcp/write.tool.update-record.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.update-record.present","value":true}
-{"key":"mcp/write.tool.update-record.schema","value":"1e39438587b403ef"}
+{"key":"mcp/write.tool.update-record.schema","value":"1bf05bb80b0b64fd"}
 {"key":"mcp/write.tool.update-record.words","value":"e43c54902d4f5b03"}
 {"key":"mcp/write.tool.vault-info.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.vault-info.present","value":true}
