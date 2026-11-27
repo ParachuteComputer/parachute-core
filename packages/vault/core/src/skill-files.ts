@@ -288,8 +288,7 @@ change when it reads again. Build these in every time.
 - When a read fails, look at \`error.code\`. Lost access or the viewer's no (\`needs_reauth\`,
   \`server_not_connected\`, \`approval_required\`, \`blocked_by_policy\`, \`consent_required\`, \`not_in_manifest\`):
   clear the rows and say what to do. \`tool_error\`: the vault refused; keep the rows and say its reason. Anything
-  else (a timeout,
-  \`server_unavailable\`): keep the last rows and say "Couldn't refresh" beside the time.
+  else (a timeout, \`server_unavailable\`): keep the last rows and say "Couldn't refresh" beside the time.
 - When a read brings a change made elsewhere, mark that row for a moment so the person sees what moved.
 - Don't redraw a row while the person is typing in it; redraw when they leave it.
 
