@@ -48,12 +48,16 @@ describe("the MCP App's edges", () => {
     expect(t.description).toContain('"people"');
     expect(t.title).not.toMatch(/\n/);
     expect(t.title.length).toBeLessThanOrEqual(60);
+    // nor in the line the model reads when it opens
+    const opened = t.resultContent!(await t.execute({}));
+    expect(JSON.stringify(opened)).not.toContain("delete-record");
   });
 
-  test("a hub that answers 503 is asked again on the next call, not taken as 'no keys' for a minute", async () => {
+  test("a hub that answers 503 or 429 is asked again on the next call, not taken as 'no keys' for a minute", async () => {
     const bearer = jwt();
     let calls = 0;
-    const fake = (async () => (++calls === 1 ? new Response("down", { status: 503 }) : Response.json({ keys: [pub] }))) as unknown as typeof fetch;
+    const fake = (async () => (++calls <= 2 ? new Response("down", { status: calls === 1 ? 503 : 429 }) : Response.json({ keys: [pub] }))) as unknown as typeof fetch;
+    expect((await approvalKeys(bearer, fake)).size).toBe(0);
     expect((await approvalKeys(bearer, fake)).size).toBe(0);
     expect([...(await approvalKeys(bearer, fake))]).toEqual([pub]);
   });

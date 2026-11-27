@@ -83,9 +83,9 @@ export async function approvalKeys(bearer: string | null, fetchImpl: typeof fetc
   let keys = new Set<string>();
   try {
     const r = await fetchImpl(`${getJwksOrigin()}/api/approval-keys`, { headers: { authorization: `Bearer ${bearer}` }, signal: AbortSignal.timeout(3_000) });
-    // a hub that is down for a moment (5xx) is asked again next time, as when it doesn't answer at all; a refusal of
+    // a hub that is down or busy for a moment (5xx, 429, 408) is asked again next time, as when it doesn't answer at all; a refusal of
     // the token (4xx) is kept like an answer
-    if (r.status >= 500) return keys;
+    if (r.status >= 500 || r.status === 429 || r.status === 408) return keys;
     if (r.ok) {
       const j = (await r.json()) as { keys?: unknown };
       if (Array.isArray(j.keys)) keys = new Set(j.keys.filter((k): k is string => typeof k === "string" && /^[0-9a-f]{64}$/.test(k)));
@@ -196,7 +196,7 @@ export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { t
       "ui/resourceUri": uri,
       "openai/ui": { entrypoints: [{ type: "global" }] },
     },
-    execute: async (): Promise<OpenResult> => ({ text: `Opened ${a.name} from the ${vaultName} vault.`, vault: vaultName, applet: { id: a.id, name: a.name } }),
+    execute: async (): Promise<OpenResult> => ({ text: `Opened the applet "${a.id}" from the ${vaultName} vault.`, vault: vaultName, applet: { id: a.id, name: a.name } }),
   } as never;
 }
 

@@ -22,7 +22,7 @@ applet"; "the view ships as a versioned package"). Code: `src/mcp-app.ts`, `src/
                "openai/ui": { "entrypoints": [{ "type": "global" }] } } }
   ```
 
-  Calling it answers one line for the model (`Opened People from the home vault.`) and `structuredContent
+  Calling it answers one line for the model (`Opened the applet "people" from the home vault.`: by id, as the description) and `structuredContent
   {vault, applet: {id, name}}` for the view. A name for an applet that isn't offered is `unknown_tool`.
 - `resources/list` names each `ui://parachute/applet/<id>`; `resources/read` answers it as `text/html;profile=mcp-app`
   (`_meta.ui.prefersBorder: false`, no CSP domains: the view loads nothing from elsewhere), the view with the applet in

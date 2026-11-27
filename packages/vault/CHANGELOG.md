@@ -13,8 +13,8 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
   applet on Claude's Artifacts page, pinnable. The view (`@openparachute/applet-host` 0.1.0, kept in
   `src/applet-host/`) runs the applet in the app's sealed frame and reaches the vault only through the host's
   `tools/call`, in the manifest's folders. Served on both MCP eras: claude.ai connects on 2026-07-28, where the views
-  sit beside the Skills extension's files. `initialize` now advertises `resources`. An applet's tool names it by its manifest id; its
-  name is only the title (one line), and the manifest's `note` isn't sent: an approval covers the code, not the
+  sit beside the Skills extension's files. `initialize` now advertises `resources`. An applet's tool, its open line and its resource
+  name it by its manifest id; its name is only the title (one line), and the manifest's `note` isn't sent: an approval covers the code, not the
   record's fields, which any writer can change. A failed applet lookup leaves the vault's own tools listed. Nothing changes for a client that
   doesn't use them, nor for a vault with no approved applets (docs/contracts/mcp-app.md).
 
