@@ -114,6 +114,7 @@
  *   /api/admin-lock/{set,change,remove,unlock,lock,heartbeat} (POST) → manage the optional admin idle PIN lock (cookie-gated; CSRF)
  *   /api/account/2fa/{start,confirm,disable} (POST) → self-service 2FA for the SPA (cookie-gated; CSRF; self-only) — hub#85
  *   /api/account/password         (POST)       → self-service password change for the SPA (cookie-gated; CSRF; self-only) — hub#85
+ *   /api/approval-keys            (GET)        → the caller's linked keys, whose signed applet approvals count (Bearer; self-only) — T-476
  *   /api/account/pubkeys          (GET)        → the signed-in user's linked Nostr pubkeys (cookie-gated; self-only) — hub#833 phase 1a
  *   /api/account/pubkeys/challenge (POST)      → mint a single-use, user-bound linkage challenge + the event template to sign (cookie-gated; CSRF)
  *   /api/account/pubkeys/verify   (POST)       → present a signed NIP-01 (kind 27235) event; verify BIP-340 possession + consume the challenge → link (cookie-gated; CSRF)
@@ -273,6 +274,7 @@ import {
   requireAnyScope,
 } from "./account-api.ts";
 import { accountMcpProtectedResource, handleAccountMcp } from "./account-mcp-http.ts";
+import { handleApprovalKeys } from "./api-approval-keys.ts";
 import { type AccountSessionDeps, handleAccountSession } from "./account-session.ts";
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountToken } from "./account-token.ts";
@@ -3717,6 +3719,11 @@ export function hubFetch(
       // a user managing their own credentials needs no admin scope). The
       // server-rendered /account/2fa + /account/change-password pages stay for
       // the no-JS / friend-facing path; these are the JSON twins.
+      // The keys whose signed applet approvals count for the caller (T-476): Bearer, self-only, read-only.
+      if (pathname === "/api/approval-keys") {
+        if (!getDb) return dbNotConfigured();
+        return handleApprovalKeys(req, { db: getDb(), knownIssuers: oauthDeps(req).hubBoundOrigins() });
+      }
       if (pathname.startsWith("/api/account/")) {
         if (!getDb) return dbNotConfigured();
         {
