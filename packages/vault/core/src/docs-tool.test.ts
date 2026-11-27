@@ -123,7 +123,10 @@ describe("the server instructions name the docs tool and the version", () => {
     const md = projectionToMarkdown({ vaultName: "home", description: null, projection, docs: { origin: "https://parachute.computer", version: "0.9.0-pre.2", newer: "0.9.1" } });
     expect(md).toStartWith('You are connected to Parachute Vault "home".\nDocs for Parachute 0.9.0-pre.2 (0.9.1 is out): `docs {search}`, `docs {topic}`; a refusal\'s `docs` is its fix page.\n');
     // the scripting guide is the docs page now, not the retired /scripting/
-    expect(md).toContain("https://parachute.computer/docs/build/scripts/");
+    // with the docs tool listed, the guides are its topics (shorter, and for this version)
+    expect(md).toContain('guide: `docs {topic: "build/scripts"}`');
+    expect(md).toContain('Guide: `docs {topic: "use/claude-artifacts"}`');
+    expect(md).not.toContain("https://parachute.computer/docs/");
   });
   test("a self-hoster's own docs are named by their address; no newer release, no aside; no docs, no section", () => {
     const own = projectionToMarkdown({ vaultName: "home", description: null, projection, docs: { origin: "https://docs.example.org/parachute/", version: "0.9.1" } });

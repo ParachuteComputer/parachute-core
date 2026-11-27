@@ -577,10 +577,7 @@ export function projectionToMarkdown(args: {
   // T-476: one line, not the five hints (`vault-info` still returns them): query-records' own description, which
   // every client reads with the tool list, says each filter, so the brief keeps its budget for what only it can say.
   lines.push(w("`query-notes { type: \"X\" }` lists a type and its subtypes; the tool says every filter."));
-
-  lines.push("");
-  lines.push("## Refreshing context");
-  lines.push("");
+  // One line under Querying (T-476: the brief's 800 tokens), not a section of its own.
   lines.push("`vault-info` refreshes this; `vault-info { help: \"<tool>\" }` gives a tool's every parameter.");
 
   lines.push("");
@@ -593,7 +590,9 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push("## Live pages (Claude artifacts)");
   lines.push("");
-  lines.push(LIVE_PAGE_BLOCK);
+  // With the docs tool listed, a guide is a `docs` topic (T-476: shorter, and for this version); without it, the URL.
+  const guide = (topic: string) => (args.docs ? `\`docs {topic: "${topic}"}\`` : `https://parachute.computer/docs/${topic}/`);
+  lines.push(LIVE_PAGE_BLOCK.replace("https://parachute.computer/docs/use/claude-artifacts/", guide("use/claude-artifacts")));
 
   // Scripting pointer block: the connect-time brief used to dead-end on
   // querying — an agent had no path to "how do I script/automate against this
@@ -605,7 +604,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push(
     args.scripting ??
-      `A script or cron job uses a key (\`parachute keys new <name> --vault ${vaultName} --can read\`) and the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/docs/build/scripts/`,
+      `A script or cron job uses a key (\`parachute keys new <name> --vault ${vaultName} --can read\`) and the REST API (\`/vault/${vaultName}/api/...\`); guide: ${guide("build/scripts")}`,
   );
 
   return lines.join("\n");
