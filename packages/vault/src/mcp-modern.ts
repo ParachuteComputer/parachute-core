@@ -7,15 +7,17 @@
  * the routing the SDK documents for "keep the existing legacy wiring beside a strict modern endpoint"
  * (`isLegacyRequest`). 2025-era requests never reach this file, so existing clients see no change.
  *
- * Both eras serve the same tools (`toolSurface` in mcp-http.ts) and the same instructions. Only this era adds the
- * Skills extension (mcp-skills.ts). Two SDKs side by side is a step, not the end: the 2025 path moves onto SDK v2 too
- * (`legacy: "stateless"`) and the 1.x wiring goes, one server for both eras (T-476 subtract line, by 12-18).
+ * Both eras serve the vault's tools (`toolSurface` in mcp-http.ts), the approved applets as an MCP App (mcp-app.ts) and
+ * the same instructions. Only this era adds the Skills extension (mcp-skills.ts). Two SDKs side by side is a step, not
+ * the end: the 2025 path moves onto SDK v2 too (`legacy: "stateless"`) and the 1.x wiring goes, one server for both
+ * eras (T-476 subtract line, by 12-18).
  */
 
-import { createMcpHandler, isLegacyRequest, McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler, isLegacyRequest, McpServer, ProtocolError, ResourceTemplate } from "@modelcontextprotocol/server";
 import { SkillsExtension, type SkillSource } from "@modelcontextprotocol/server/ext/skills";
 import pkg from "../package.json" with { type: "json" };
-import type { toolSurface } from "./mcp-http.ts";
+import type { AppletViews, toolSurface } from "./mcp-http.ts";
+import { APPLET_URI_PREFIX, MCP_APP_MIME } from "./mcp-app.ts";
 
 export { isLegacyRequest };
 
@@ -24,6 +26,8 @@ export interface ModernDoor {
   instruction: string;
   tools: ReturnType<typeof toolSurface>;
   skills: SkillSource;
+  /** The approved applets' views, when the door has a view build to serve (mcp-app.ts). */
+  views?: AppletViews;
 }
 
 /** The door a request was routed with, handed to the factory through the handler's `authInfo` pass-through. */
@@ -48,7 +52,7 @@ function modernHandler(): ReturnType<typeof createMcpHandler> {
       // SDK v2 hands the request's envelope (`_meta`: protocol version, client capabilities) to the handler apart from
       // its params; the file argument's `x-mcp-file` mark follows the client's declared capabilities (#164).
       mcp.server.setRequestHandler("tools/list", async (_request, ctx) => ({
-        tools: door.tools.list(ctx.mcpReq.envelope) as never,
+        tools: (await door.tools.list(ctx.mcpReq.envelope)) as never,
       }));
       // One way to refuse (core/src/mcp-refusal.ts): the tool layer answers every refusal as an `isError` result with
       // `structuredContent {error_type, message, ...}` and throws none, so this era says them exactly as the 2025 one.
@@ -58,6 +62,22 @@ function modernHandler(): ReturnType<typeof createMcpHandler> {
           undefined,
         ),
       );
+      // The approved applets' views (an MCP App), beside the skills' files in the same resource registry: claude.ai
+      // connects on 2026-07-28 and declares MCP Apps there (io.modelcontextprotocol/ui, T-476 claudereal 11-25).
+      const views = door.views;
+      if (views) {
+        mcp.registerResource(
+          "parachute-applets",
+          new ResourceTemplate(`${APPLET_URI_PREFIX}{id}`, { list: async () => ({ resources: await views.list() }) }),
+          { mimeType: MCP_APP_MIME },
+          async (uri) => {
+            const r = await views.read(uri.href);
+            // the 2025 door's words for a view this key may not open, or that doesn't exist (InvalidParams)
+            if (!r) throw new ProtocolError(-32602, `No resource ${uri.href}`);
+            return r;
+          },
+        );
+      }
       new SkillsExtension({ source: door.skills }).attach(mcp);
       return mcp;
     },
