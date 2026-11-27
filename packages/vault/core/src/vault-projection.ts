@@ -604,7 +604,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push(
     args.scripting ??
-      `A script or cron job uses a key (\`parachute keys new <name> --vault ${vaultName} --can read\`) and the REST API (\`/vault/${vaultName}/api/...\`); guide: ${guide("build/scripts")}`,
+      `A script or cron job uses a key (\`parachute keys new <name> --vault ${vaultName} --can read\`) and the REST API (\`<hub-origin>/vault/${vaultName}/api/...\`); guide: ${guide("build/scripts")}`,
   );
 
   return lines.join("\n");

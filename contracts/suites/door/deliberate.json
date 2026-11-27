@@ -194,7 +194,7 @@
         "connect/written-by.stamp",
         "connect/refresh.*",
         "connect/admin-scope",
-    "connect/admin-scope.*",
+        "connect/admin-scope.as-drawn",
         "connect/revoke.*"
       ],
       "between": [
@@ -368,6 +368,23 @@
       "status": "drift",
       "owner": "T-476 add-attachment: a cloud-style door lists it once its engine pin carries it and it wires the ticket seam's storeUpload (parachute-cloud)",
       "why": "A box takes a small file in the MCP call itself (`add-attachment {record, file}`, the file-transfer extension's FileInput with base64 `data` and a SHA-256 `digest`, up to the measured inline cap), so an AI whose runtime can't reach the ticket URL (Claude's code sandbox) can still store it. A cloud-style door on an engine before T-476 has only `attachment-url`, whose bytes go to a URL that sandbox can't reach."
+    },
+    {
+      "id": "mcp-app-resources",
+      "keys": [
+        "mcp/admin.capabilities",
+        "mcp/read.capabilities",
+        "mcp/write.capabilities"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "T-476 (applets as an MCP App on Cloud's door: core #170's door half)",
+      "why": "Since core #170 a box serves a vault's approved applets as MCP App resources (`ui://parachute/applet/<id>`) on both MCP eras, so its initialize advertises `resources`. Cloud's vault door and the personal door don't serve applets yet, so they advertise `tools` only. Their tools and refusals are the box's.",
+      "note": "Delete this entry when Cloud's door serves the applet resources; until then the capability lists differ by exactly `resources`."
     }
   ]
 }
