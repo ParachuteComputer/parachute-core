@@ -42,6 +42,7 @@ import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { KEY_NAME_RE, type KeyClaim } from "./keys.ts";
 import { mcpToolErrorLine } from "./mcp-error-log.ts";
+import { accountDocs, withRefusalDocs } from "./docs-links.ts";
 import {
   NostrHttpAuthError,
   type NostrReplayCache,
@@ -304,7 +305,18 @@ function isMcpToolResult(value: unknown): value is { content: unknown[] } {
   );
 }
 
+/** A tools/call, every refusal with `docs` on it (T-476): a vault's carries its own; the door's own gets it here. */
 async function handleToolCall(
+  id: JsonRpcId,
+  params: Record<string, unknown> | undefined,
+  ctx: AccountToolContext,
+): Promise<JsonRpcMessage> {
+  const msg = await callTool(id, params, ctx);
+  const r = (msg as { result?: unknown }).result;
+  return r && typeof r === "object" && (r as { isError?: unknown }).isError === true ? { ...msg, result: withRefusalDocs(r as never, accountDocs()) } as JsonRpcMessage : msg;
+}
+
+async function callTool(
   id: JsonRpcId,
   params: Record<string, unknown> | undefined,
   ctx: AccountToolContext,

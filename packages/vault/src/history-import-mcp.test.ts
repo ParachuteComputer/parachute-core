@@ -1,3 +1,5 @@
+import { docsPageUrl, refusalTopic } from "../core/src/docs-tool.ts";
+import pkg from "../package.json" with { type: "json" };
 import { test, expect } from "bun:test";
 import { handleMcp } from "./mcp-http.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
@@ -23,16 +25,16 @@ test("HTTP MCP forwards valid imported history references only on the dedicated 
   const rpc = await errorEnvelope(fields);
   expect(rpc.error).toBeUndefined();
   expect(rpc.result.isError).toBe(true);
-  expect(rpc.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history", origin: "git-import", import_ix: 0 });
+  expect(rpc.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history", origin: "git-import", import_ix: 0, docs: docsFor("history_unrecoverable") });
   for (const invalid of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "0", null]) {
     const bad = await errorEnvelope({ ...fields, import_ix: invalid });
     expect(bad.result.isError).toBe(true);
-    expect(bad.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history" });
+    expect(bad.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history", docs: docsFor("history_unrecoverable") });
   }
   const generic = await errorEnvelope({ ...fields, code: "OTHER" });
-  expect(generic.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history" });
+  expect(generic.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history", docs: docsFor("history_unrecoverable") });
   const native = await errorEnvelope({ code: "HISTORY_UNRECOVERABLE", error_type: "history_unrecoverable", version_ix: 0, note_id: "note" });
-  expect(native.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history" });
+  expect(native.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history", docs: docsFor("history_unrecoverable") });
 });
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -43,6 +45,8 @@ import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { generateScopedMcpTools } from "./mcp-tools.ts";
 import { applyImportedNote, beginImportRun, importTargetDigest } from "../core/src/history-import.ts";
 import { resolveHistoryPolicy } from "../core/src/history.ts";
+/** T-476: every refusal carries `docs`, the page with its fix for this box's version. */
+const docsFor = (type: string) => docsPageUrl({ origin: process.env.PARACHUTE_DOCS_URL!, version: pkg.version }, refusalTopic(type));
 
 test("HTTP MCP imported get/list/error keeps discriminator and rejects mixed selectors", async () => {
   const saved = process.env.PARACHUTE_HOME;
@@ -83,7 +87,7 @@ test("HTTP MCP imported get/list/error keeps discriminator and rejects mixed sel
     expect(broken.error).toBeUndefined();
     expect(broken.result.isError).toBe(true);
     const { message, ...brokenFields } = broken.result.structuredContent;
-    expect(brokenFields).toEqual({ error_type: "history_unrecoverable", origin: "git-import", import_ix: 0 });
+    expect(brokenFields).toEqual({ error_type: "history_unrecoverable", origin: "git-import", import_ix: 0, docs: docsFor("history_unrecoverable") });
     expect(message).not.toContain("@-1");
     const scoped = generateScopedMcpTools("import-test", { ...auth, scoped_tags: ["journal"] }).find(t => t.name === "query-notes")!;
     const denied = await scoped.execute({ versions: { note_id: note.id, origin: "git-import", import_ix: 0 } });

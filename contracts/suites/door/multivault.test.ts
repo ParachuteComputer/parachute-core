@@ -53,6 +53,15 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
       fp("multivault/writer.tools", names);
       const create = tools.find((t) => t.name === "create-record")!;
       expect((create.inputSchema as { required?: string[] }).required ?? []).toContain("vault");
+      // `docs` touches no vault (T-476): no `vault` to name, and a call without one reaches a vault's docs tool (which
+      // answers with the page, or the copy built in: never that a vault is missing).
+      const docs = tools.find((t) => t.name === "docs");
+      if (docs) {
+        expect((docs.inputSchema as { required?: string[] }).required ?? []).not.toContain("vault");
+        expect(Object.keys((docs.inputSchema as { properties?: object }).properties ?? {})).not.toContain("vault");
+        const answer = await c.call("docs", { topic: "fix/needs-admin" }).then((r: unknown) => JSON.stringify(r), (e: Error) => e.message);
+        expect(answer).not.toMatch(/vault is required|invalid_vault|name the vault/i);
+      }
 
       // A write with no vault is refused, and the refusal names the vaults the key reaches.
       const path = `${runId("multi")}/note`;

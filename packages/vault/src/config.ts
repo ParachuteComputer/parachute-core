@@ -109,6 +109,11 @@ function logsDirPath(): string {
   return join(vaultHomePath(), "logs");
 }
 
+/** Where the vault's global config lives (`<PARACHUTE_HOME>/vault/config.yaml`). */
+export function globalConfigFile(): string {
+  return globalConfigPath();
+}
+
 function globalConfigPath(): string {
   return join(vaultHomePath(), "config.yaml");
 }
@@ -374,6 +379,15 @@ export interface TriggerConfig {
 
 export interface GlobalConfig {
   port: number;
+  /**
+   * Where the `docs` MCP tool reads Parachute's docs (T-476, core/src/docs-tool.ts): `base_url` is an http(s)
+   * address of a copy of parachute.computer (a self-hoster's own), or `off` for no docs tool, no Docs line in the
+   * connect-time brief and no /latest.json check. Unset: https://parachute.computer. PARACHUTE_DOCS_URL wins over it.
+   *
+   *   docs:
+   *     base_url: https://docs.example.org
+   */
+  docs?: { base_url?: string };
   default_vault?: string;
   api_keys?: StoredKey[];
   triggers?: TriggerConfig[];
@@ -1661,6 +1675,21 @@ export function readGlobalConfig(): GlobalConfig {
       if (autoTranscribeEnabled !== undefined) {
         config.auto_transcribe = { enabled: autoTranscribeEnabled };
       }
+      // docs block (T-476): `base_url` under `docs:`, 2-space indent, same grammar as auto_transcribe.
+      // `docs: off` on one line is the same as `base_url: off`
+      if (/^docs:\s*(off|false|none|0)\s*(?:#.*)?$/im.test(yaml)) config.docs = { base_url: "off" };
+      const docsStart = yaml.match(/^docs:\s*$/m);
+      if (docsStart) {
+        const after = yaml.slice((docsStart.index ?? 0) + docsStart[0].length);
+        for (const line of after.split("\n")) {
+          if (line.match(/^[^\s#]/)) break; // next top-level key (a comment doesn't end the block)
+          const m = line.match(/^\s+base_url:\s*"?([^"\s#]+)"?\s*(?:#.*)?$/);
+          if (m) {
+            config.docs = { base_url: m[1]! };
+            break;
+          }
+        }
+      }
 
       // Parse backup_codes: a YAML list of quoted bcrypt hashes under
       //   backup_codes:
@@ -1733,6 +1762,10 @@ export function writeGlobalConfig(config: GlobalConfig): void {
   if (config.auto_create !== undefined) lines.push(`auto_create: ${config.auto_create}`);
   if (config.embeddings_enabled !== undefined) lines.push(`embeddings_enabled: ${config.embeddings_enabled}`);
   if (config.default_mirror) lines.push(`default_mirror: ${config.default_mirror}`);
+  if (config.docs?.base_url) {
+    lines.push("docs:");
+    lines.push(`  base_url: ${config.docs.base_url}`);
+  }
   if (config.owner_password_hash) {
     lines.push(`owner_password_hash: "${config.owner_password_hash}"`);
   }

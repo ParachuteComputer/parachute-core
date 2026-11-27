@@ -141,8 +141,20 @@ export function refusalOfError(err: unknown): McpRefusal | null {
   return null;
 }
 
-/** What a door answers for a tool it doesn't offer this caller (never saying whether it exists at another level). */
-export const unknownToolRefusal = (name: string): McpRefusal => refusal("unknown_tool", `Unknown tool: ${name}`, { tool: name });
+/** What a connection at each level is told it has, when it calls a tool it can't see (T-476). */
+const LEVEL_WORDS: Record<"read" | "write" | "admin", string> = {
+  read: "This connection can read; tools that write or need admin aren't listed for it.",
+  write: "This connection can read and write; tools that need admin aren't listed for it.",
+  admin: "tools/list names every tool this connection has.",
+};
+
+/**
+ * What a door answers for a tool it doesn't offer this caller. It never says whether the tool exists at another level
+ * (the same words for a tool above the caller and for none at all); given the caller's own `level`, it says what that
+ * level is, so an AI can tell the person "this needs admin" (T-476; the `docs` page says how the person grants it).
+ */
+export const unknownToolRefusal = (name: string, level?: "read" | "write" | "admin"): McpRefusal =>
+  refusal("unknown_tool", `Unknown tool: ${name}${level ? `. ${LEVEL_WORDS[level]}` : ""}`, { tool: name });
 
 /** What a door answers for an error nobody tagged: a crash, not a refusal; the door logs it (mcp-error-log.ts). */
 export const internalRefusal = (err: unknown): McpRefusal => refusal("internal_error", `Error: ${err instanceof Error ? err.message : "Unknown error"}`);

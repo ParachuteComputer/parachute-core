@@ -14,6 +14,8 @@
  *
  * Port 19420 is fixed (the server reads PORT); first-boot-create.test.ts uses 19410/19411, stop-signal 19404.
  */
+import { docsPageUrl, refusalTopic } from "../core/src/docs-tool.ts";
+import pkg from "../package.json" with { type: "json" };
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
@@ -23,6 +25,8 @@ import { mcpToolErrorLine, redactErrorMessage, stackFrames } from "../core/src/m
 import { handleMcp } from "./mcp-http.ts";
 import type { AuthResult } from "./auth.ts";
 import pkg from "../package.json" with { type: "json" };
+/** T-476: every refusal carries `docs`, the page with its fix for this box's version. */
+const docsFor = (type: string) => docsPageUrl({ origin: process.env.PARACHUTE_DOCS_URL!, version: pkg.version }, refusalTopic(type));
 
 const SERVER_PATH = resolve(import.meta.dir, "server.ts");
 const PORT = 19_420;
@@ -271,7 +275,7 @@ describe("handleMcp — a tool that throws on purpose", () => {
 
   test("a TypeError logs one line; the client's refusal says internal_error with the same text", async () => {
     const { body, logged } = await callThrowing(new TypeError("x.y is not a function"));
-    const sc = { error_type: "internal_error", message: "Error: x.y is not a function" };
+    const sc = { error_type: "internal_error", message: "Error: x.y is not a function", docs: docsFor("internal_error") };
     expect(body.result).toEqual({ content: [{ type: "text", text: JSON.stringify(sc, null, 2) }], structuredContent: sc, isError: true });
     const crashes = logged.filter((l) => l.includes("event=mcp_tool_error"));
     expect(crashes).toHaveLength(1);
@@ -283,7 +287,7 @@ describe("handleMcp — a tool that throws on purpose", () => {
     const refusal = Object.assign(new Error("nope"), { error_type: "not_found" });
     const { body, logged } = await callThrowing(refusal);
     expect(body.result?.isError).toBe(true);
-    expect(body.result?.structuredContent).toEqual({ error_type: "not_found", message: "nope" });
+    expect(body.result?.structuredContent).toEqual({ error_type: "not_found", message: "nope", docs: docsFor("not_found") });
     expect(logged.filter((l) => l.includes("event=mcp_tool_error"))).toEqual([]);
   });
 });

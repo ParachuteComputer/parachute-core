@@ -6,6 +6,8 @@
  */
 
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
+import { docsOrigin, latestRelease, newerRelease, type DocsContext } from "../core/src/docs-tool.ts";
+import pkg from "../package.json" with { type: "json" };
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
@@ -60,7 +62,8 @@ import {
 } from "./token-store.ts";
 import { chooseHubOrigin, mintHubJwt, revokeHubJwt } from "./mcp-install.ts";
 import { looksLikeJwt } from "./hub-jwt.ts";
-import { readGlobalConfig, DEFAULT_PORT } from "./config.ts";
+import { readGlobalConfig, globalConfigFile, DEFAULT_PORT } from "./config.ts";
+import { statSync } from "node:fs";
 import { getBaseUrl } from "./oauth-discovery.ts";
 import { getSharedAttachmentTicketProvider, storeTicketUpload } from "./attachment-tickets.ts";
 import { createFsAttachmentBytesProvider } from "./attachment-bytes.ts";
@@ -135,6 +138,8 @@ export async function getServerInstruction(
     attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url", addEnabled: !auth || hasScopeForVault(auth.scopes, vaultName, "write") },
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
+    // T-476: the docs for this version; "X is out" from the site's /latest.json as last read (never waited on).
+    docs: docsLine(boxDocs()),
     // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
     ...(auth
       ? {
@@ -145,6 +150,39 @@ export async function getServerInstruction(
         }
       : {}),
   });
+}
+
+/**
+ * Where this box's docs are and which version they're for (T-476, core/src/docs-tool.ts): PARACHUTE_DOCS_URL, else
+ * `docs.base_url` in the vault config, else parachute.computer; `off` in either is no docs. The version is core's.
+ */
+export function boxDocs(): DocsContext {
+  // Read a few times per MCP request (the brief, the tools, the refusals): the config file is parsed again only when
+  // it or PARACHUTE_DOCS_URL changed.
+  const env = process.env.PARACHUTE_DOCS_URL;
+  let mtime = -1;
+  let size = -1;
+  try {
+    const st = statSync(globalConfigFile());
+    mtime = st.mtimeMs;
+    size = st.size;
+  } catch {
+    // no config file: the default
+  }
+  const key = `${env ?? ""}|${globalConfigFile()}|${mtime}|${size}`;
+  if (docsKept?.key !== key) docsKept = { key, value: { origin: docsOrigin(env, mtime < 0 ? undefined : readGlobalConfig().docs?.base_url), version: pkg.version } };
+  return docsKept.value;
+}
+let docsKept: { key: string; value: DocsContext } | null = null;
+
+/** The docs tool's options for this box's docs; null: no tool. */
+function toolDocs(d: DocsContext): { origin: string; version: string } | null {
+  return d.origin === null ? null : { origin: d.origin, version: d.version };
+}
+
+/** The brief's docs line for this box's docs, with "X is out" from the site's /latest.json as last read (never awaited). */
+function docsLine(d: DocsContext): { origin: string; version: string; newer: string | null } | null {
+  return d.origin === null ? null : { origin: d.origin, version: d.version, newer: newerRelease(d.version, latestRelease(d.origin).value) };
 }
 
 /**
@@ -402,6 +440,7 @@ export function generateScopedMcpTools(
         }
       : {}),
     doorTool: (name) => (name === "manage-token" || name === "manage-keys" ? { ...manageTokenReference(vaultName), name } : undefined),
+    docs: toolDocs(boxDocs()),
   });
   applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 
