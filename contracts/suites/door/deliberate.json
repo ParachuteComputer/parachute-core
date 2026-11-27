@@ -194,6 +194,7 @@
         "connect/written-by.stamp",
         "connect/refresh.*",
         "connect/admin-scope",
+    "connect/admin-scope.*",
         "connect/revoke.*"
       ],
       "between": [
