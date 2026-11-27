@@ -175,7 +175,7 @@ export async function approvedApplets(tools: readonly McpToolDef[], vaultName: s
 export const appletUri = (id: string) => `${APPLET_URI_PREFIX}${id}`;
 
 /** What `open-<id>` answers: one line for the model; the view gets the rest as structuredContent. */
-export type OpenResult = { text: string; vault: string; applet: { id: string; name: string } };
+export type OpenResult = { text: string; vault: string; applet: { id: string } };
 
 export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { title: string; annotations: typeof READ; _meta: Record<string, unknown>; resultContent: (r: unknown) => { type: "text"; text: string }[]; resultStructured: (r: unknown) => Record<string, unknown> } {
   const uri = appletUri(a.id);
@@ -196,7 +196,7 @@ export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { t
       "ui/resourceUri": uri,
       "openai/ui": { entrypoints: [{ type: "global" }] },
     },
-    execute: async (): Promise<OpenResult> => ({ text: `Opened the applet "${a.id}" from the ${vaultName} vault.`, vault: vaultName, applet: { id: a.id, name: a.name } }),
+    execute: async (): Promise<OpenResult> => ({ text: `Opened the applet "${a.id}" from the ${vaultName} vault.`, vault: vaultName, applet: { id: a.id } }),
   } as never;
 }
 

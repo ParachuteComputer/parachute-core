@@ -131,7 +131,7 @@ describe("mcp/app: the person's approved applets as an MCP App", () => {
   test("opening it: one line for the model, the applet for the view; the others are unknown tools", async () => {
     const r: any = await reader.client.callTool({ name: `open-${ids.ok}`, arguments: {} });
     expect(r.content).toEqual([{ type: "text", text: `Opened the applet "${ids.ok}" from the ${s.vaultName} vault.` }]);
-    expect(r.structuredContent).toEqual({ vault: s.vaultName, applet: { id: ids.ok, name: `App ${ids.ok}` } });
+    expect(r.structuredContent).toEqual({ vault: s.vaultName, applet: { id: ids.ok } });
     for (const id of [ids.none, ids.strange, ids.changed, ids.back]) {
       const no: any = await reader.client.callTool({ name: `open-${id}`, arguments: {} });
       expect(no.structuredContent?.error_type).toBe("unknown_tool");

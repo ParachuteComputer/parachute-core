@@ -49,8 +49,10 @@ describe("the MCP App's edges", () => {
     expect(t.title).not.toMatch(/\n/);
     expect(t.title.length).toBeLessThanOrEqual(60);
     // nor in the line the model reads when it opens
-    const opened = t.resultContent!(await t.execute({}));
-    expect(JSON.stringify(opened)).not.toContain("delete-record");
+    const result = await t.execute({});
+    expect(JSON.stringify(t.resultContent!(result))).not.toContain("delete-record");
+    // nor in structuredContent, which some hosts (ChatGPT's Apps SDK) show the model too
+    expect(JSON.stringify(t.resultStructured!(result))).not.toContain("delete-record");
   });
 
   test("a hub that answers 503 or 429 is asked again on the next call, not taken as 'no keys' for a minute", async () => {
