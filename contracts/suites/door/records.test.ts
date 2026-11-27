@@ -71,6 +71,7 @@ describe.skipIf(!is09)("the record door over MCP", () => {
       expect(named, words).toBeTruthy();
       const brief = c.client.getInstructions() ?? "";
       expect(/if_updated_at: record\.(\w+)/.exec(brief)?.[1], "the brief's live-page words name the same key").toBe(named!);
+      expect(brief, "the brief's live-page words make an open page read again on its own").toContain("refetchInterval: 30000");
       const path = `records/${runId("page")}`;
       await c.call("create-record", { path, fields: { status: "open" }, body: "Water the beds." });
       const r = one(await c.call("query-records", { id: path }));

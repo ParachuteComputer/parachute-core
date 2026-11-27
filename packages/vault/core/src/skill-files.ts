@@ -267,6 +267,22 @@ viewer's Claude): \`query-records\` to read, \`update-record\` to change, \`crea
 - A refusal comes back as an error whose message names the reason (\`conflict\`, \`not_found\`); say it in words.
 - Writes need a viewer whose connection may write; a read-only viewer still sees the page.
 
+## Keep it current
+
+An open page isn't told when a record changes elsewhere (another chat, the Parachute app, another AI). It sees the
+change when it reads again, so build these in every time (measured in claude.ai, 2026-11-27):
+
+- Give the watch \`{ refetchInterval: 30000 }\`. Thirty seconds is the shortest claude.ai allows; a lower number is
+  raised to it. With no interval the page reads once, when it opens.
+- The interval pauses while the page is hidden and reads again within a second when the person comes back. Don't add
+  a focus or visibility handler.
+- Show when the page last read ("Updated just now", "Updated 2 min ago"): \`result.cache.storedAt\` when the result
+  has a \`cache\` marker, else the time it arrived. Keep the line ticking.
+- Beside it, a Refresh button that calls \`invalidate\`: every watch reads again at once.
+- When a read fails, keep the last rows on screen and say "Couldn't refresh" beside the time. Never blank the page.
+- When a read brings a change made elsewhere, mark that row for a moment so the person sees what moved.
+- Don't redraw a row while the person is typing in it; redraw when they leave it.
+
 ## Keep it plain
 
 One page, the vault's own names, no invented fields. Empty sections are normal for a viewer who hasn't connected

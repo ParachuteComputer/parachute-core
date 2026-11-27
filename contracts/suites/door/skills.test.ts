@@ -233,6 +233,8 @@ describe.skipIf(!is09 || lacks("skills-extension"))("skills over MCP 2026-07-28:
     }
     const live = await modern("read", "resources/read", { uri: skills[1].resources[0].uri });
     expect(live.result.contents[0].text).toContain("if_updated_at: record.updatedAt");
+    // An open page isn't told of a change made elsewhere: the recipe must make it read again on its own (T-476).
+    expect(live.result.contents[0].text).toContain("refetchInterval: 30000");
   });
 
   test("vault-guide never carries a writer's free text: a type's description, a field's, or a long allowed value", async () => {

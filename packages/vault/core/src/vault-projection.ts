@@ -386,9 +386,10 @@ export const SKILLS_LINE =
  * query-records' own description; the long form is the docs page it names and the `live-page` skill.
  */
 export const LIVE_PAGE_BLOCK =
-  "A Claude artifact reads with `watchTool` on `query-records` and writes on a click with `update-record` " +
-  "(`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again; a refusal is `isError`. Guide: " +
-  "https://parachute.computer/docs/use/claude-artifacts/";
+  "A Claude artifact reads with `watchTool` on `query-records` (`{ refetchInterval: 30000 }`, so an open page picks up " +
+  "changes made elsewhere), shows when it last read beside a Refresh that `invalidate`s, and writes on a click with " +
+  "`update-record` (`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again; a refusal is " +
+  "`isError`. Guide: https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
   vaultName: string;

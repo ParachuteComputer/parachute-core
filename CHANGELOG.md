@@ -21,6 +21,11 @@ the wire-level detail.
 can reach the vault's host, and that from a code sandbox (as in claude.ai, whose sandbox can't reach it) a file is
 stored with `add-attachment` (T-476).
 
+**Live pages stay current.** The `live-page` skill and the brief's live-pages line now tell an AI to build a page
+that reads again every 30 seconds while it is on screen (`refetchInterval: 30000`, claude.ai's shortest), shows when
+it last read, and has a Refresh. Measured in claude.ai: a page with no interval reads once, when it opens; one with
+an interval pauses while hidden and catches up within a second on return (T-476).
+
 ## 0.9.0-pre.2
 
 No schema number moves (hub.db stays 24): going back to 0.9.0-pre.1 is code-only (docs/UPGRADE-0.9.md). On the way
