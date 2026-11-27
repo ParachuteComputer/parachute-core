@@ -5,6 +5,22 @@ Each section says what changed since the one below it, for someone running Parac
 brackets. The hub's and the vault's own changelogs (`packages/hub/CHANGELOG.md`, `packages/vault/CHANGELOG.md`) carry
 the wire-level detail.
 
+## Unreleased
+
+**The sign-in screen.**
+- A connected AI gets read and write, not admin, unless you tick admin. claude.ai asks for every scope a vault lists,
+  and the consent page had admin ticked, so pressing Approve gave Claude the vault's tag schema, settings, triggers,
+  backup and key minting. Discovery now lists read and write only (as Parachute Cloud does); admin starts unticked on
+  the consent page, marked powerful, also when offered as additional access, for every app (Parachute's own app's
+  Manage now takes one tick). If you ticked admin for an AI, a Reconnect shows the page again rather than silently
+  dropping it. An app that registered itself is labelled "Self-registered" in plain words, not "External, a
+  third-party app" in red. Connections approved before this keep what they were given: to take admin back from one,
+  end it in the vault's list and connect again (T-476).
+
+**The connect-time words.** The brief and the attachment tools tell an AI that `attachment-url` is for a client that
+can reach the vault's host, and that from a code sandbox (as in claude.ai, whose sandbox can't reach it) a file is
+stored with `add-attachment` (T-476).
+
 ## 0.9.0-pre.2
 
 No schema number moves (hub.db stays 24): going back to 0.9.0-pre.1 is code-only (docs/UPGRADE-0.9.md). On the way

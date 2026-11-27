@@ -460,10 +460,29 @@ describe("renderConsent", () => {
     expect(html).toContain("Registered through this hub");
     // The external badge / copy must NOT appear for a same-hub client.
     expect(html).not.toContain('class="badge badge-trust-external"');
-    expect(html).not.toContain("third-party app that registered itself");
+    expect(html).not.toContain("registered itself");
   });
 
-  test("renders the external trust marker for a third-party DCR client", () => {
+  // T-476 claudereal: admin starts unticked and says why it is powerful, for every app.
+  test("an admin row starts unticked with the powerful line; read and write stay ticked", () => {
+    const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "Claude", scopes: ["vault:work:read", "vault:work:write", "vault:work:admin"], sameHub: false });
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:read" checked />');
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:write" checked />');
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:admin" />');
+    expect(html).toContain("<strong>Powerful.</strong> The app could change how the vault works and make keys of its own. Tick it only if you want this app to manage the vault.");
+  });
+  test("Parachute's own app gets admin unticked too: a name earns no tick", () => {
+    const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "Parachute", scopes: ["vault:work:admin"], sameHub: false, parachuteApp: "device" });
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:admin" />');
+  });
+  test("the sign-in page before consent says admin is powerful, with nothing to tick", () => {
+    const html = renderApprovePending({ clientName: "Claude", clientId: "c", redirectUris: ["https://app.example/cb"], requestedScopes: ["vault:read", "vault:admin"], requestedVault: null, hubOrigin: "https://hub.example", approveForm: null, loginNextUrl: "/" } as unknown as Parameters<typeof renderApprovePending>[0]);
+    expect(html).toContain("<strong>Powerful.</strong>");
+    expect(html).not.toContain("Tick it only");
+  });
+
+  // T-476: plain words for an app that registered itself (claude.ai always does), no "External", "third-party" or red.
+  test("renders the self-registered trust marker for a DCR client, in plain words", () => {
     const html = renderConsent({
       params: PARAMS,
       csrfToken: CSRF,
@@ -473,8 +492,10 @@ describe("renderConsent", () => {
       sameHub: false,
     });
     expect(html).toContain('class="badge badge-trust-external"');
-    expect(html).toContain(">External<");
-    expect(html).toContain("third-party app that registered itself");
+    expect(html).toContain(">Self-registered<");
+    expect(html).toContain("It registered itself when you connected it. Approve if you started this connection.");
+    expect(html).not.toContain(">External<");
+    expect(html).not.toContain("third-party");
     // The first-party badge / copy must NOT appear for an external client.
     expect(html).not.toContain('class="badge badge-trust-same-hub"');
     expect(html).not.toContain("Registered through this hub");
@@ -482,7 +503,7 @@ describe("renderConsent", () => {
 
   // T-476: Parachute's own app (a Parachute-looking name with only first-party redirects, `parachuteAppHome`) said
   // "External: a third-party app" and "goes to the company that runs it". A walker nearly pressed Deny.
-  test("Parachute's own app on this device: a plain marker, no External, no company line", () => {
+  test("Parachute's own app on this device: a plain marker, not self-registered, no company line", () => {
     const html = renderConsent({
       params: PARAMS,
       csrfToken: CSRF,
@@ -513,7 +534,7 @@ describe("renderConsent", () => {
     expect(html).not.toContain("company that runs it");
   });
 
-  test("any other app keeps External and the company line", () => {
+  test("any other app keeps the self-registered marker and the company line", () => {
     const html = renderConsent({
       params: PARAMS,
       csrfToken: CSRF,

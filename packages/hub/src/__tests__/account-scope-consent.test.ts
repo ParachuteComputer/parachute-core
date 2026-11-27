@@ -146,7 +146,8 @@ describe("requestable is NOT the same as advertised", () => {
     const body = (await res.json()) as { scopes_supported: string[] };
     // The ordinary surface is advertised…
     expect(body.scopes_supported).toContain("vault:read");
-    expect(body.scopes_supported).toContain("vault:admin");
+    // …but not vault admin (T-476): a catalog-copying connector would ask for it every time.
+    expect(body.scopes_supported).not.toContain("vault:admin");
     // account:vaults is requestable at this door but not advertised here —
     // catalog-copy would combine it with vault scopes, which authorize refuses.
     expect(body.scopes_supported).not.toContain("account:vaults");
