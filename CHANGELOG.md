@@ -21,6 +21,14 @@ the wire-level detail.
 can reach the vault's host, and that from a code sandbox (as in claude.ai, whose sandbox can't reach it) a file is
 stored with `add-attachment` (T-476).
 
+**Parachute applets inside Claude.** The applets you approved in the Parachute app show in Claude as their own tiles
+(an MCP App): each opens full screen and can be pinned. It runs in the app's sealed frame and reaches only the folders
+its manifest names. An applet you didn't approve, or one whose code changed since, isn't offered (T-476).
+
+**One way to refuse.** Every MCP refusal, on every door and both MCP versions, is a normal tool result marked
+`isError` with `structuredContent {error_type, message, …}`. Hosts such as Claude's artifacts now see the vault's own
+words instead of a generic error. Clients that read the old JSON-RPC error should read the result (T-476).
+
 ## 0.9.0-pre.2
 
 No schema number moves (hub.db stays 24): going back to 0.9.0-pre.1 is code-only (docs/UPGRADE-0.9.md). On the way
