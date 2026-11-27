@@ -89,22 +89,6 @@
       "why": "The account door's replies share `name`, `url`, `vault_token` and `services[\"vault:<name>\"]` on every door, and the contracts hold those. Beyond them each door adds its own: cloud lists `vault_id`, `created_at`, `mcp_url`, `usage` and a second `services.vault` key; a box lists `caps`, `version` and `token_guidance`; the delete reply reports each runtime's own clean-up. Build on the shared fields; derive the MCP address as `<url>/mcp`."
     },
     {
-      "id": "admin-scope-not-advertised",
-      "keys": [
-        "connect/admin-scope.advertised",
-        "connect/authorization-server.scopes_supported",
-        "mcp/protected-resource.scopes_supported"
-      ],
-      "between": [
-        "box",
-        "cloud",
-        "personal"
-      ],
-      "status": "drift",
-      "owner": "Aaron (also audit L2-10: should an AI connector be offered admin at all)",
-      "why": "Both doors grant `vault:<name>:admin` to an app that asks and is approved. A box lists it in `scopes_supported`; cloud lists only read and write. A connector that asks for what is advertised can declare types on a box and not on cloud."
-    },
-    {
       "id": "mcp-instructions",
       "keys": [
         "mcp/read.instructions.sections",

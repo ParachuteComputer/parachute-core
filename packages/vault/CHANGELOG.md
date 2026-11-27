@@ -27,6 +27,8 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 - `HEAD /api/records/<id>` (and `/api/notes/<id>`) answers like GET without the body: 200 with GET's headers and the length of its body, 404 for a missing record, and 404 for a record a tag-scoped key can't see. It was passed through with no answer. Reading one record (GET or HEAD, on both routes) now also sends `ETag` (a strong hash of the answer, so it moves on any change the caller can see, tags included) and `Last-Modified` (the record's update time), so a client can tell whether a record changed (0.9.3, T-463).
 
 ### Changed
+- **Per-vault discovery lists read and write, not admin (T-476).** `scopes_supported` on `/vault/<name>/.well-known/oauth-protected-resource` (and the forwarding authorization-server document) is `vault:<name>:read vault:<name>:write`: claude.ai requested every listed scope, admin included. Admin stays requestable by name; the hub's consent page offers it unticked.
+- **The connect-time brief says which way to store a file where (T-476).** `attachment-url` is "for a client that can reach this host"; "If you can't reach this host (a code sandbox, as in claude.ai), store a file with `add-attachment`". claude.ai's code sandbox can't reach a vault's host, so a ticket URL always failed there. The `attachment-url` and `add-attachment` short descriptions and `request-attachment-upload`'s say the same.
 - **One way to refuse, on every MCP door (T-476, a meaning change for clients).** Every refusal of a tool call is now
   a normal result with `isError: true` and `structuredContent: {error_type, message, ...fields}`, its one text block
   that object as JSON. Before, a refusal came three ways: a JSON-RPC error carrying `data.error_type` (a conflict, a

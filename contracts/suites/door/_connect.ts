@@ -80,8 +80,67 @@ async function approve(authorizeEndpoint: string, params: Record<string, string>
   return loc;
 }
 
-/** Everything a consumer app does to connect, given only the MCP URL and the person's approval. */
-export async function connect(opts: { scope?: (vault: string) => string; appName: string }): Promise<Connected & Discovery> {
+const attr = (tag: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1];
+const unescapeHtml = (s: string) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+
+/**
+ * What a browser posts when the person presses the page's main button without changing anything (T-476): the consent
+ * form's hidden inputs, the boxes and radios as drawn, each select's chosen option, and the primary button's own name
+ * and value. Read from the door's own page, so it holds whatever the page ticks by default, on every door.
+ */
+export function asDrawn(html: string): [string, string][] {
+  const marker = html.search(/name="__action"\s+value="consent"/);
+  expect(marker, "the consent page has a consent form").toBeGreaterThan(-1);
+  const form = html.slice(html.lastIndexOf("<form", marker), html.indexOf("</form>", marker));
+  const out: [string, string][] = [];
+  for (const [tag] of form.matchAll(/<input\b[^>]*>/g)) {
+    const name = attr(tag, "name");
+    if (!name || /\sdisabled\b/.test(tag)) continue;
+    const type = attr(tag, "type") ?? "text";
+    const value = unescapeHtml(attr(tag, "value") ?? "on");
+    if (type === "hidden" || ((type === "checkbox" || type === "radio") && /\schecked\b/.test(tag))) out.push([name, value]);
+  }
+  for (const [, attrs, body] of form.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+    const name = attr(attrs ?? "", "name");
+    const chosen = /<option\b[^>]*\sselected\b[^>]*>/.exec(body ?? "")?.[0] ?? /<option\b[^>]*>/.exec(body ?? "")?.[0];
+    if (name && chosen) out.push([name, unescapeHtml(attr(chosen, "value") ?? "")]);
+  }
+  const button = [...form.matchAll(/<button\b[^>]*>/g)].map(([t]) => t).find((t) => /class="[^"]*primary/.test(t) && attr(t, "name"));
+  expect(button, "the consent form has a primary button").toBeString();
+  out.push([attr(button!, "name")!, unescapeHtml(attr(button!, "value") ?? "")]);
+  return out;
+}
+
+/** The person opens the consent page and presses Approve (Allow) as it is drawn. */
+async function approveAsDrawn(authorizeEndpoint: string, params: Record<string, string>): Promise<string> {
+  const d = door();
+  if (d.signIn.how !== "cookie") throw new Error("approve: this door's owner signs in with a key; the consent screen needs a browser session");
+  const first = await safeFetch(`${authorizeEndpoint}?${new URLSearchParams(params)}`, { headers: { cookie: d.signIn.cookie } });
+  if (first.status === 302) return first.headers.get("location")!;
+  expect(first.status).toBe(200);
+  const body = new URLSearchParams(asDrawn(await first.text()));
+  let cookie = d.signIn.cookie;
+  if (d.kind === "box") {
+    const csrf = setCookie(first, "parachute_hub_csrf") ?? d.signIn.csrf;
+    cookie = `parachute_hub_session=${/parachute_hub_session=([^;]+)/.exec(d.signIn.cookie)![1]!}; parachute_hub_csrf=${csrf}`;
+  }
+  const consent = await safeFetch(authorizeEndpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", origin: d.issuer, cookie },
+    body,
+  });
+  const text = await consent.text();
+  const bridged = text.match(/location\.replace\((.*)\);<\/script>/)?.[1];
+  const loc = consent.headers.get("location") ?? (bridged ? (JSON.parse(bridged) as string) : "");
+  expect(loc, `consent gave ${consent.status}: ${text.slice(0, 200)}`).toBeTruthy();
+  return loc;
+}
+
+/**
+ * Everything a consumer app does to connect, given only the MCP URL and the person's approval. `asDrawn`: the person
+ * presses Approve on the page as the door draws it, rather than the contract naming the approval's fields.
+ */
+export async function connect(opts: { scope?: (vault: string) => string; appName: string; asDrawn?: boolean }): Promise<Connected & Discovery> {
   const d = door();
   const disc = await discover();
   const { as } = disc;
@@ -107,7 +166,7 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
     state,
     resource: mcpUrl(),
   };
-  const back = new URL(await approve(as.authorization_endpoint, params));
+  const back = new URL(await (opts.asDrawn ? approveAsDrawn(as.authorization_endpoint, params) : approve(as.authorization_endpoint, params)));
   expect(`${back.origin}${back.pathname}`).toBe(REDIRECT);
   expect(back.searchParams.get("state")).toBe(state);
   const code = back.searchParams.get("code");

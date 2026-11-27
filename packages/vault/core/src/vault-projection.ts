@@ -320,14 +320,15 @@ export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; rea
   if (opts.ticketsEnabled) {
     sentences.push(
       opts.ticketTool
-        ? `\`${opts.ticketTool}\` gives a one-use URL to PUT or GET the bytes.`
-        : "`request-attachment-upload` / `request-attachment-download` give a one-use URL to PUT or GET the bytes.",
+        ? `\`${opts.ticketTool}\` gives a one-use URL to PUT or GET the bytes, for a client that can reach this host.`
+        : "`request-attachment-upload` / `request-attachment-download` give a one-use URL to PUT or GET the bytes, for a client that can reach this host.",
     );
   }
   if (opts.addEnabled) {
-    // T-476: the one way that needs no network beyond the MCP call itself, so an AI in a sandbox uses it.
+    // T-476: the one way that needs no network beyond the MCP call itself. claude.ai's code sandbox can't reach a
+    // vault's host (its egress proxy refuses it), so there a ticket URL always fails and this is the way.
     sentences.push(
-      `\`add-attachment\` stores a file of up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB sent in the call: use it when you hold the bytes.`,
+      `If you can't reach this host (a code sandbox, as in claude.ai), store a file with \`add-attachment\`: up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB sent in the call.`,
     );
   }
   if (opts.readEnabled) {

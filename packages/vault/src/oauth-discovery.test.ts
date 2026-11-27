@@ -9,6 +9,9 @@ import { handleAuthorizationServer, handleProtectedResource } from "./oauth-disc
  * expected vault.<name>, got vault") — the live "Authorization with the MCP
  * server failed" bug. See oauth-discovery.ts + auth.ts findBroadVaultScopes.
  */
+// T-476 claudereal: claude.ai asks for every scope the vault advertises. Advertising admin made every Claude
+// connection ask for the vault's schema, settings, triggers, backup and key minting. Admin stays requestable (an app
+// that needs it asks by name, and the person can tick it on the consent page); it just isn't in the menu.
 describe("oauth-discovery per-vault scopes_supported is resource-narrowed", () => {
   const req = new Request("https://hub.example.com/vault/default/.well-known/oauth-protected-resource");
 
@@ -20,7 +23,6 @@ describe("oauth-discovery per-vault scopes_supported is resource-narrowed", () =
     expect(body.scopes_supported).toEqual([
       "vault:default:read",
       "vault:default:write",
-      "vault:default:admin",
     ]);
     // No broad scope leaks through — vault rejects those on audience mismatch.
     for (const s of body.scopes_supported) {
@@ -38,7 +40,6 @@ describe("oauth-discovery per-vault scopes_supported is resource-narrowed", () =
     expect(body.scopes_supported).toEqual([
       "vault:work-notes:read",
       "vault:work-notes:write",
-      "vault:work-notes:admin",
     ]);
   });
 
@@ -49,7 +50,6 @@ describe("oauth-discovery per-vault scopes_supported is resource-narrowed", () =
     expect(body.scopes_supported).toEqual([
       "vault:default:read",
       "vault:default:write",
-      "vault:default:admin",
     ]);
   });
 });
