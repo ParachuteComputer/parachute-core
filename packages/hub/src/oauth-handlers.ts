@@ -58,6 +58,7 @@ import {
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import {
   findGrant,
+  inReachOfAsk,
   isCoveredByGrant,
   isCoveredByGrantForClientName,
   recordGrant,
@@ -561,6 +562,12 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
       // to ask for. Discovery advertises the ordinary surface; account-wide
       // authority is opt-in by intent, not by catalog-copying.
       .filter((scope) => !scope.toLowerCase().startsWith("account:"))
+      // Vault admin, the same way (T-476 claudereal): claude.ai requested `vault:admin` because it was listed, so every
+      // Claude connection asked for the vault's schema, settings, triggers, backup and key minting. It stays
+      // requestable: an app that needs it asks by name, and the consent page offers it unticked under "Grant
+      // additional access", so the person who wants Claude to manage tags ticks it there. Parachute Cloud never
+      // listed it; now both doors say the same.
+      .filter((scope) => !isAnyVaultAdminScope(scope))
       .filter((scope) => {
         for (const [prefix, short] of OPTIONAL_MODULE_SCOPES) {
           if (scope.startsWith(prefix) && !installedShorts.has(short)) return false;
@@ -568,6 +575,12 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
         return true;
       })
   );
+}
+
+/** `vault:admin` or `vault:<name>:admin`, any casing (scope-explanations.ts `isVaultAdminScope` matches the named form only). */
+function isAnyVaultAdminScope(scope: string): boolean {
+  const parts = scope.toLowerCase().split(":");
+  return parts[0] === "vault" && parts[parts.length - 1] === "admin" && (parts.length === 2 || parts.length === 3);
 }
 
 /**
@@ -580,7 +593,10 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
  * service that doesn't know hub's scope set. Two consequences, both observed
  * live:
  *
- *   - **`vault:admin` was missing.** Vault's root PRM hard-codes
+ *   - **`vault:admin` was missing.** (T-476 took it out again on purpose: see
+ *     `advertisedScopes`. Admin stays reachable over MCP through the consent
+ *     page's unticked "additional access" box, not through the catalog.)
+ *     Vault's root PRM hard-codes
  *     `[read, write]` on the reasoning that "admin is an operator concern, not
  *     something the consent picker offers". That reasoning predates the
  *     2026-05-29 single-consent change, which made per-vault
@@ -1019,6 +1035,7 @@ function pendingClientResponse(
       client.clientName,
       client.redirectUris,
       requestedScopes,
+      isAnyVaultAdminScope,
     )
   ) {
     console.log(
@@ -1448,6 +1465,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         client.clientName,
         client.redirectUris,
         earlyRequested,
+        isAnyVaultAdminScope,
       )
     ) {
       console.log(
@@ -1597,7 +1615,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   if (
     !hasStaleAssignment &&
     userHasVaultPosture &&
-    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)) ||
+    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes, isAnyVaultAdminScope)) ||
       unnamedCoveredByAccountGrant ||
       perVaultCovered !== null)
   ) {
@@ -2042,6 +2060,20 @@ export function grantableExtraScopes(
   opts: { userIsAdmin: boolean; requested: readonly string[]; vaultName?: string | undefined },
 ): string[] {
   const v = opts.vaultName;
+  // An ask with every vault already named (a connector at `/vault/<name>/mcp`) draws no picker to bind an unnamed
+  // extra, so ticking `vault:admin` there ended on "Pick a vault" (T-476): name the extras for those vaults instead.
+  // An ask with an unnamed vault verb draws the picker, which binds the unnamed extras as before.
+  const askedVaults = new Set(
+    opts.requested.flatMap((s) => {
+      const parts = s.split(":");
+      return parts.length === 3 && parts[0] === "vault" && parts[1] !== "*" ? [parts[1]!] : [];
+    }),
+  );
+  const unnamedAsked = opts.requested.some((s) => {
+    const parts = s.split(":");
+    return parts.length === 2 && parts[0] === "vault";
+  });
+  const extraVaults = v ? [v] : askedVaults.size > 0 && !unnamedAsked ? [...askedVaults] : [];
   // The picker is the only path to `account:vaults`. Offering it as an extra
   // next to the client's vault scopes hits `accountVaultsCombinedWithOtherScopes`
   // at mint — a checkbox that looks grantable and then bounces the whole
@@ -2059,8 +2091,8 @@ export function grantableExtraScopes(
     );
   }
   const candidates = [
-    ...(v
-      ? [`vault:${v}:read`, `vault:${v}:write`, `vault:${v}:admin`]
+    ...(extraVaults.length > 0
+      ? extraVaults.flatMap((x) => [`vault:${x}:read`, `vault:${x}:write`, `vault:${x}:admin`])
       : ["vault:read", "vault:write", "vault:admin"]),
     ...restLadder,
   ];
@@ -2131,6 +2163,12 @@ function issueAuthCodeRedirect(
   scopes: string[],
   userId: string,
   deps: OAuthDeps,
+  /**
+   * The ask the person just approved on the consent page (T-476): the grant keeps no vault admin for a vault this ask
+   * reaches that they didn't grant this time, so an admin left unticked stops bringing the page back on every Reconnect
+   * (the skip gates read the grant). Absent on every silent path, which never drops anything.
+   */
+  consentedAsk?: readonly string[],
 ): Response {
   // Anti-privesc cap at the single choke-point. Runs AFTER any narrowing the
   // callers did (unnamed `vault:admin` → `vault:<picked>:admin`), so it sees
@@ -2189,7 +2227,13 @@ function issueAuthCodeRedirect(
   const grantNow = deps.now?.() ?? new Date();
   const code = db.transaction(() => {
     if (perVaultChoice) applyAccountDoorChoice(db, userId, params.clientId, dedupedScopes, grantNow);
-    recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, perVaultChoice ? isAccountDoorChoiceScope : undefined);
+    const replaces = (scope: string) =>
+      (perVaultChoice && isAccountDoorChoiceScope(scope)) ||
+      (consentedAsk !== undefined &&
+        isAnyVaultAdminScope(scope) &&
+        !dedupedScopes.includes(scope) &&
+        inReachOfAsk(scope, [...consentedAsk, ...dedupedScopes]));
+    recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, replaces);
     return issueAuthCode(db, {
       clientId: params.clientId,
       userId,
@@ -2471,6 +2515,9 @@ async function handleConsentSubmit(
   // One box may carry several wire forms that read the same (space-separated). `granted_scope_present` says the page
   // drew the boxes (T-476): then only what is ticked is granted, even nothing, which is the denial below. Without it
   // (a programmatic POST, an older page), the fallback above holds.
+  // The ask as the page drew it, named forms only (an unnamed verb is bound to the picked vault, which the granted
+  // scopes name): the vaults this consent speaks for, whatever the person ticks (review round 3).
+  const askedHere = scopes.filter((sc) => sc.split(":").length !== 2 || !sc.startsWith("vault:"));
   const grantedFields = form
     .getAll("granted_scope")
     .flatMap((v) => String(v).split(" "))
@@ -2759,7 +2806,7 @@ async function handleConsentSubmit(
     scopes = applied.scopes;
   }
 
-  return issueAuthCodeRedirect(db, params, scopes, session.userId, deps);
+  return issueAuthCodeRedirect(db, params, scopes, session.userId, deps, askedHere);
 }
 
 /**
@@ -4066,7 +4113,7 @@ function consentProps(
     // consent screen. Clean DB-backed signal: the `same_hub` column written
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
-    // T-476: Parachute's own app says so instead of External, and has no company its reads go to. Words only.
+    // T-476: Parachute's own app says so instead of "Self-registered", and has no company its reads go to. Words only.
     ...(parachuteApp ? { parachuteApp } : {}),
     grantableExtras,
     ...(vaultLevels ? { vaultLevels } : {}),

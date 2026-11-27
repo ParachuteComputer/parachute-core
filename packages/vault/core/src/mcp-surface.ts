@@ -182,7 +182,10 @@ function applyElevenTools(tools: McpToolDef[], opts: RecordSurfaceOpts): McpTool
           }
           if (!writeMay || problem) {
             const why = problem ? ` ${problem.message}` : name === "manage-types" && opts.hasVerb("write") ? " With write access you can make a new type, and add fields to a type you made (action update)." : "";
-            throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.${why}`);
+            // A refusal (T-476), not a crash: untagged, it was answered `internal_error` and logged as one.
+            throw Object.assign(new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.${why}`), {
+              error_type: "insufficient_scope",
+            });
           }
         }
         if (typeName !== null) {

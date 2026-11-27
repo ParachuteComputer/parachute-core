@@ -244,7 +244,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
   },
 
   "add-attachment": {
-    description: `A file onto a record, inline (\`file.data\` base64, \`file.digest\` SHA-256), up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB, else attachment-url. ${HELP("add-attachment")}`,
+    description: `A file onto a record, inline (\`file.data\` base64, \`file.digest\` SHA-256), when you can't reach this host; up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB. ${HELP("add-attachment")}`,
     inputSchema: obj(
       {
         record: str(),
@@ -424,7 +424,7 @@ export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, strin
     folds: { update: "update-tag", rename: "rename-tag", merge: "merge-tags", delete: "delete-tag", prune: "prune-schema", migrate: "migrate-field" },
   },
   "attachment-url": {
-    description: `A one-use URL for an attachment's bytes. upload: \`record\`, \`filename\` and exact \`size_bytes\`, then PUT the bytes to \`url\`. download: \`attachment_id\` (from query-records \`include_attachments: true\`). ${HELP("attachment-url")}`,
+    description: `A one-use URL for an attachment's bytes, if you can reach this host (else add-attachment). upload: \`record\`, \`filename\` and exact \`size_bytes\`, then PUT the bytes to \`url\`. download: \`attachment_id\` (from query-records \`include_attachments: true\`). ${HELP("attachment-url")}`,
     inputSchema: obj(
       {
         action: { type: "string", enum: ["upload", "download"] },

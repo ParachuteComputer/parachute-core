@@ -398,7 +398,7 @@ describe("the consent page says what the connection can read", () => {
   });
 });
 
-// ── 3c. Parachute's own app is named as such; everyone else stays External (T-476) ───────────────────────────
+// ── 3c. Parachute's own app is named as such; everyone else stays self-registered (T-476) ───────────────────────────
 // Three first-run walkers met their own Parachute app (it returns to 127.0.0.1) as "External: a third-party app that
 // registered itself", with "what this app reads goes to the company that runs it"; one nearly pressed Deny. And on a
 // phone with no session the page said "App not yet approved … send this link to your hub admin" to the hub's owner,
@@ -409,7 +409,7 @@ describe("the consent page says what the connection can read", () => {
 // Mutant "consent-parachute-by-loopback" calls every loopback app Parachute's; "consent-parachute-by-word" every
 // Parachute-looking name.
 
-describe("Parachute's own app is named on the consent page; other apps stay External", () => {
+describe("Parachute's own app is named on the consent page; other apps stay self-registered", () => {
   let session: string;
   const marker = "Parachute's app on this device: it returns only here.";
   const vendor = "What this app reads from your vault goes to the company that runs it.";
@@ -418,28 +418,28 @@ describe("Parachute's own app is named on the consent page; other apps stay Exte
     session = await signIn(await newUser("consent-own-app"));
   });
 
-  test("Parachute's app on this device: no External, no company", async () => {
+  test("Parachute's app on this device: not self-registered, no company", async () => {
     const redirect = "http://127.0.0.1:47219/oauth/callback";
     const text = visibleText(await consentPage(session, await registered("Parachute", redirect), redirect));
     expect(text).toContain(marker);
-    expect(text).not.toContain("External");
+    expect(text).not.toContain("Self-registered");
     expect(text).not.toContain("registered itself");
     expect(text).not.toContain(vendor);
   });
 
-  test("an app named Claude on loopback is still External, with the company line", async () => {
+  test("an app named Claude on loopback is still self-registered, with the company line", async () => {
     const redirect = "http://127.0.0.1:53690/callback";
     const text = visibleText(await consentPage(session, await registered("Claude", redirect), redirect));
-    expect(text).toContain("External");
+    expect(text).toContain("Self-registered");
     expect(text).toContain(vendor);
     expect(text).not.toContain(marker);
   });
 
-  test("Claude Code connected as 'parachute' (its name holds the word) is still External, with the company line", async () => {
+  test("Claude Code connected as 'parachute' (its name holds the word) is still self-registered, with the company line", async () => {
     // Claude Code registers as "Claude Code (<server>)"; the hub's own commands name the server parachute.
     const redirect = "http://localhost:53691/callback";
     const text = visibleText(await consentPage(session, await registered("Claude Code (parachute)", redirect), redirect));
-    expect(text).toContain("External");
+    expect(text).toContain("Self-registered");
     expect(text).toContain(vendor);
     expect(text).not.toContain(marker);
   });

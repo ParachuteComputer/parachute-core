@@ -112,6 +112,10 @@ describe("mcp/write-types: write access may add a new type", () => {
     expect(put.status).toBe(200);
     const c = await writer();
     await expect(c.call("manage-types", { tag: theirs, fields: { [field()]: { type: "string" } } })).rejects.toThrow(/admin/);
+    // a refusal (T-476: insufficient_scope, the person's step, the fix page), not a crash said as internal_error
+    const r = await c.call("manage-types", { tag: theirs, fields: { [field()]: { type: "string" } } }).then(() => null, (e: { refusal?: Record<string, unknown> }) => e.refusal);
+    expect(r?.error_type).toBe("insufficient_scope");
+    expect(String(r?.docs)).toMatch(/\/fix\/needs-admin\/#what-the-refusal-says$/);
     await c.close();
   });
 

@@ -152,12 +152,39 @@ export function isCoveredByGrant(
   userId: string,
   clientId: string,
   requestedScopes: readonly string[],
+  /** A scope a silent re-link must not drop (vault admin, T-476): see `holdsPowerfulBeyondAsk`. */
+  powerful?: (scope: string) => boolean,
 ): boolean {
   if (requestedScopes.length === 0) return false;
   const grant = findGrant(db, userId, clientId);
   if (!grant) return false;
+  if (powerful && holdsPowerfulBeyondAsk(grant, requestedScopes, powerful)) return false;
   const granted = new Set(grant.scopes);
   return requestedCoveredByGranted(granted, requestedScopes);
+}
+
+/**
+ * The grant holds a powerful scope the ask doesn't name (T-476): admin the person ticked as additional access, which a
+ * connector such as claude.ai never asks for again. A silent re-link mints only the ask, so it would drop that choice
+ * with no page to make it again; the skip gates fall through to the consent page instead, where the person chooses.
+ */
+function holdsPowerfulBeyondAsk(grant: Grant, requestedScopes: readonly string[], powerful: (scope: string) => boolean): boolean {
+  const asked = new Set(requestedScopes);
+  return grant.scopes.some((scope) => powerful(scope) && !asked.has(scope) && inReachOfAsk(scope, requestedScopes));
+}
+
+/**
+ * Whether a vault `scope` is about what this ask reaches (T-476 review): a vault the ask names, or any vault when the ask
+ * has an unnamed vault verb the page will bind. One app connected to two vaults must not bounce between consent pages
+ * over the other vault's admin. Only vault scopes: these rules are about vault admin (account access ticked as an extra
+ * keeps its earlier behaviour, and module scopes are never offered as extras).
+ */
+export function inReachOfAsk(scope: string, requestedScopes: readonly string[]): boolean {
+  const parts = scope.split(":");
+  if (parts[0] !== "vault") return false;
+  const asked = requestedScopes.map((r) => r.split(":")).filter((r) => r[0] === "vault");
+  if (asked.some((r) => r.length === 2)) return true;
+  return parts.length === 2 || asked.some((r) => r.length === 3 && r[1] === parts[1]);
 }
 
 /**
@@ -237,10 +264,13 @@ export function isCoveredByGrantForClientName(
   clientName: string,
   clientRedirectUris: readonly string[],
   requestedScopes: readonly string[],
+  /** A scope a silent re-link must not drop (vault admin, T-476): see `holdsPowerfulBeyondAsk`. */
+  powerful?: (scope: string) => boolean,
 ): boolean {
   if (requestedScopes.length === 0) return false;
   const grant = findGrantByClientName(db, userId, clientName, clientRedirectUris);
   if (!grant) return false;
+  if (powerful && holdsPowerfulBeyondAsk(grant, requestedScopes, powerful)) return false;
   const granted = new Set(grant.scopes);
   return requestedCoveredByGranted(granted, requestedScopes);
 }

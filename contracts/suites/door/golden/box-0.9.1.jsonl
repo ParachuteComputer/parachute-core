@@ -30,7 +30,8 @@
 {"key":"annotations/destructive.tools","value":["add-attachment","create-note","create-record","delete-note","delete-record","delete-tag","manage-keys","manage-token","manage-types","merge-tags","prune-schema","rename-tag","update-note","update-record","update-tag","vault-info"]}
 {"key":"annotations/read-only.tools","value":["attachment-url","docs","doctor","find-path","list-tags","list-types","query-notes","query-records","read-attachment","request-attachment-download","vault-info"]}
 {"key":"connect/admin-scope","value":{"granted":"admin read write"}}
-{"key":"connect/admin-scope.advertised","value":true}
+{"key":"connect/admin-scope.advertised","value":false}
+{"key":"connect/admin-scope.as-drawn","value":"read write"}
 {"key":"connect/authorization-server.authorization_endpoint","value":"string"}
 {"key":"connect/authorization-server.code_challenge_methods_supported","value":["string"]}
 {"key":"connect/authorization-server.grant_types_supported","value":["string"]}
@@ -138,11 +139,11 @@
 {"key":"mcp/admin.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.add-attachment.present","value":true}
 {"key":"mcp/admin.tool.add-attachment.schema","value":"57a4ad1fb87584f3"}
-{"key":"mcp/admin.tool.add-attachment.words","value":"832ff10c4e0d1dd7"}
+{"key":"mcp/admin.tool.add-attachment.words","value":"9eb00ea605b7ff9b"}
 {"key":"mcp/admin.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.attachment-url.present","value":true}
 {"key":"mcp/admin.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
-{"key":"mcp/admin.tool.attachment-url.words","value":"9b3181a3240b803a"}
+{"key":"mcp/admin.tool.attachment-url.words","value":"a8d05ae38c978ecd"}
 {"key":"mcp/admin.tool.create-note.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.create-note.present","value":true}
 {"key":"mcp/admin.tool.create-note.schema","value":"6959ce1ef7951c85"}
@@ -280,7 +281,7 @@
 {"key":"mcp/read.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.attachment-url.present","value":true}
 {"key":"mcp/read.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
-{"key":"mcp/read.tool.attachment-url.words","value":"9b3181a3240b803a"}
+{"key":"mcp/read.tool.attachment-url.words","value":"a8d05ae38c978ecd"}
 {"key":"mcp/read.tool.docs.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":true,"readOnlyHint":true}}
 {"key":"mcp/read.tool.docs.present","value":true}
 {"key":"mcp/read.tool.docs.schema","value":"7e3411fe7a464e23"}
@@ -343,11 +344,11 @@
 {"key":"mcp/write.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.add-attachment.present","value":true}
 {"key":"mcp/write.tool.add-attachment.schema","value":"57a4ad1fb87584f3"}
-{"key":"mcp/write.tool.add-attachment.words","value":"832ff10c4e0d1dd7"}
+{"key":"mcp/write.tool.add-attachment.words","value":"9eb00ea605b7ff9b"}
 {"key":"mcp/write.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.attachment-url.present","value":true}
 {"key":"mcp/write.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
-{"key":"mcp/write.tool.attachment-url.words","value":"9b3181a3240b803a"}
+{"key":"mcp/write.tool.attachment-url.words","value":"a8d05ae38c978ecd"}
 {"key":"mcp/write.tool.create-note.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.create-note.present","value":true}
 {"key":"mcp/write.tool.create-note.schema","value":"6959ce1ef7951c85"}
