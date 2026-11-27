@@ -13,7 +13,9 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
   applet on Claude's Artifacts page, pinnable. The view (`@openparachute/applet-host` 0.1.0, kept in
   `src/applet-host/`) runs the applet in the app's sealed frame and reaches the vault only through the host's
   `tools/call`, in the manifest's folders. Served on both MCP eras: claude.ai connects on 2026-07-28, where the views
-  sit beside the Skills extension's files. `initialize` now advertises `resources`. Nothing changes for a client that
+  sit beside the Skills extension's files. `initialize` now advertises `resources`. An applet's tool names it by its manifest id; its
+  name is only the title (one line), and the manifest's `note` isn't sent: an approval covers the code, not the
+  record's fields, which any writer can change. A failed applet lookup leaves the vault's own tools listed. Nothing changes for a client that
   doesn't use them, nor for a vault with no approved applets (docs/contracts/mcp-app.md).
 
 - **An AI can store a small file in the MCP call itself: `add-attachment` (T-476).** `add-attachment {record, file}` (write) takes the file-transfer extension's FileInput (`id`, `name`, `mimeType`, `size`, a SHA-256 `digest`, base64 `data`), checks the size and the digest, and stores it as a spent upload ticket does (transcription included). For an AI whose runtime can't reach `attachment-url`'s ticket host, such as Claude's code sandbox, whose MCP calls come from Anthropic's servers. Up to 80 KiB, the size a Claude model was measured to type into one call byte for byte; a bigger file is refused with `inline_too_large` and pointed at `attachment-url`. A wrong size or digest is refused (`size_mismatch`, `digest_mismatch`) and nothing is stored. The `file` schema is marked `x-mcp-file` for a client that declares the extension. The connect-time brief tells an AI to use it when it holds the bytes. Not on the account door. `docs/HTTP_API.md`, "A file in the call".

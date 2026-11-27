@@ -9,12 +9,13 @@ applet"; "the view ships as a versioned package"). Code: `src/mcp-app.ts`, `src/
 
 - `initialize` (2025) advertises `resources` beside `tools`; on 2026-07-28 `server/discover` already has `resources`
   for the Skills extension's files.
-- For each applet the person approved by code hash, one tool (a note longer than 160 characters is cut: the record's
-  words go into the host's tool list):
+- For each applet the person approved by code hash, one tool. The approval's hash covers the code, not the record's
+  fields, which anyone who can write the vault may change: so the description names the applet by its manifest id,
+  the name is only the title (one line, 60 characters), and the manifest's `note` isn't sent:
 
   ```json
   { "name": "open-people", "title": "People",
-    "description": "Open People, a Parachute applet in the home vault, as an interactive view: …",
+    "description": "Open the Parachute applet \"people\" in the home vault as an interactive view. It reads and writes …",
     "inputSchema": { "type": "object", "properties": {} },
     "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
     "_meta": { "ui": { "resourceUri": "ui://parachute/applet/people" }, "ui/resourceUri": "ui://parachute/applet/people",

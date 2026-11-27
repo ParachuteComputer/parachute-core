@@ -209,7 +209,11 @@ export function toolSurface(
   // A reader's door: the applets are read through its own query-records, so they are what the caller may read.
   let applets: Promise<ApprovedApplet[]> | null = null;
   const approved = () => (applets ??= app && hasScopeForVault(auth.scopes, vaultName, "read")
-    ? approvalKeys(app.bearer).then((keys) => approvedApplets(visibleTools, vaultName, keys, hubOrigins()))
+    ? approvalKeys(app.bearer).then((keys) => approvedApplets(visibleTools, vaultName, keys, hubOrigins())).catch((err) => {
+      // a lookup that fails costs the applets, never the vault's own tools: one server-log line, and no tiles this time
+      console.error(mcpToolErrorLine(`${OPEN_PREFIX}*`, err, pkg.version));
+      return [] as ApprovedApplet[];
+    })
     : Promise.resolve([]));
   return {
     // `meta`: the request's `_meta` (T-476: a file argument is marked `x-mcp-file` only for a client that declared the
