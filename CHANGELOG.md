@@ -21,11 +21,19 @@ the wire-level detail.
 can reach the vault's host, and that from a code sandbox (as in claude.ai, whose sandbox can't reach it) a file is
 stored with `add-attachment` (T-476).
 
-**Live pages stay current.** The `live-page` skill and the brief's live-pages line now tell an AI to build a page
-that reads again every 30 seconds while it is on screen (`refetchInterval: 30000`, claude.ai's shortest), shows when
-it last read, and has a Refresh. Measured in claude.ai: a page with no interval reads only when it opens and when
-it calls `invalidate`; one with an interval pauses while hidden and catches up in about a second on return. Before, Claude
-chose 60 seconds on its own (T-476).
+**Parachute applets inside Claude.** The applets you approved in the Parachute app show in Claude as their own tiles
+(an MCP App): each opens full screen and can be pinned. It runs in the app's sealed frame and reaches only the folders
+its manifest names. An applet you didn't approve, or one whose code changed since, isn't offered (T-476).
+
+**One way to refuse.** Every MCP refusal, on every door and both MCP versions, is a normal tool result marked
+`isError` with `structuredContent {error_type, message, …}`. Hosts such as Claude's artifacts now see the vault's own
+words instead of a generic error. Clients that read the old JSON-RPC error should read the result (T-476).
+
+**Live pages stay current.** The `live-page` skill now tells an AI to build a page that reads again every 30 seconds
+while it is on screen (`refetchInterval: 30000`, claude.ai's shortest), shows when it last read, and has a Refresh;
+the brief's live-pages line names the interval. Measured in claude.ai: a page with no interval reads only when it
+opens and when it calls `invalidate`; one with an interval pauses while hidden and catches up in about a second on
+return. Before, Claude chose 60 seconds on its own (T-476).
 
 ## 0.9.0-pre.2
 

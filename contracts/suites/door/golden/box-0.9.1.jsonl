@@ -131,7 +131,7 @@
 {"key":"links/find-path.shape","value":{"edges":[{"relationship":"string","source":"string","sourcePath":"string","target":"string","targetPath":"string"}],"nodes":[{"id":"string","path":"string"}],"path":["string"],"relationships":["string"]}}
 {"key":"links/link.shape","value":{"createdAt":"string","relationship":"string","sourceId":"string","sourceNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"},"targetId":"string","targetNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"}}}
 {"key":"links/unresolved.warning","value":[{"code":"string","message":"string","relationship":"string","target":"string"}]}
-{"key":"mcp/admin.capabilities","value":["tools"]}
+{"key":"mcp/admin.capabilities","value":["resources","tools"]}
 {"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
 {"key":"mcp/admin.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/admin.tool-count","value":26}
@@ -269,7 +269,7 @@
 {"key":"mcp/reach.read","value":"This connection can read the whole vault. It can't change anything."}
 {"key":"mcp/reach.write","value":"This connection can read the whole vault, and create, change and delete its records."}
 {"key":"mcp/read-calls-write-tool","value":"no such tool"}
-{"key":"mcp/read.capabilities","value":["tools"]}
+{"key":"mcp/read.capabilities","value":["resources","tools"]}
 {"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
 {"key":"mcp/read.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/read.tool-count","value":10}
@@ -328,7 +328,7 @@
 {"key":"mcp/structured.update-note.append+id","value":{"contentKey":true,"structured":true}}
 {"key":"mcp/update-note.result.shape","value":{"content":"string","created":"boolean","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","tags":["string"],"types":[],"updatedAt":"string"}}
 {"key":"mcp/vault-info.result.keys","value":["coordinates","description","getting_started","indexed_fields","map","name","query_hints","tags"]}
-{"key":"mcp/write.capabilities","value":["tools"]}
+{"key":"mcp/write.capabilities","value":["resources","tools"]}
 {"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
 {"key":"mcp/write.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/write.tool-count","value":19}
