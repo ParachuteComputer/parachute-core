@@ -159,7 +159,7 @@ export async function handleMcp(
  */
 export function appletViews(tools: ReturnType<typeof toolSurface>, view: string, vaultName: string): AppletViews {
   return {
-    list: async () => (await tools.applets()).map((a) => ({ uri: appletUri(a.id), name: a.name, title: a.name, mimeType: MCP_APP_MIME })),
+    list: async () => (await tools.applets()).map((a) => ({ uri: appletUri(a.id), name: a.id, title: a.name, mimeType: MCP_APP_MIME })),
     read: async (uri) => {
       const a = uri.startsWith(APPLET_URI_PREFIX) ? (await tools.applets()).find((x) => appletUri(x.id) === uri) : undefined;
       return a ? resourceOf(view, a, vaultName) : null;
@@ -215,7 +215,11 @@ export function toolSurface(
   // A reader's door: the applets are read through its own query-records, so they are what the caller may read.
   let applets: Promise<ApprovedApplet[]> | null = null;
   const approved = () => (applets ??= app && hasScopeForVault(auth.scopes, vaultName, "read")
-    ? approvalKeys(app.bearer).then((keys) => approvedApplets(visibleTools, vaultName, keys, hubOrigins()))
+    ? approvalKeys(app.bearer).then((keys) => approvedApplets(visibleTools, vaultName, keys, hubOrigins())).catch((err) => {
+      // a lookup that fails costs the applets, never the vault's own tools: one server-log line, and no tiles this time
+      console.error(mcpToolErrorLine(`${OPEN_PREFIX}*`, err, pkg.version));
+      return [] as ApprovedApplet[];
+    })
     : Promise.resolve([]));
   return {
     // `meta`: the request's `_meta` (T-476: a file argument is marked `x-mcp-file` only for a client that declared the

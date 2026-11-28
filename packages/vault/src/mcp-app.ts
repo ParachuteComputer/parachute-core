@@ -83,6 +83,9 @@ export async function approvalKeys(bearer: string | null, fetchImpl: typeof fetc
   let keys = new Set<string>();
   try {
     const r = await fetchImpl(`${getJwksOrigin()}/api/approval-keys`, { headers: { authorization: `Bearer ${bearer}` }, signal: AbortSignal.timeout(3_000) });
+    // a hub that is down or busy for a moment (5xx, 429, 408) is asked again next time, as when it doesn't answer at all; a refusal of
+    // the token (4xx) is kept like an answer
+    if (r.status >= 500 || r.status === 429 || r.status === 408) return keys;
     if (r.ok) {
       const j = (await r.json()) as { keys?: unknown };
       if (Array.isArray(j.keys)) keys = new Set(j.keys.filter((k): k is string => typeof k === "string" && /^[0-9a-f]{64}$/.test(k)));
@@ -114,7 +117,6 @@ export type ApprovedApplet = {
   id: string;
   name: string;
   glyph?: string;
-  note?: string;
   record: { id: string; path: string; extension: string; tags: string[]; fields: Record<string, unknown> };
   code: string;
   approval: ApprovalContent;
@@ -145,7 +147,7 @@ export async function approvedApplets(tools: readonly McpToolDef[], vaultName: s
   const out: ApprovedApplet[] = [];
   const ids = new Set<string>();
   for (const r of applets.sort((a, b) => String(a.path).localeCompare(String(b.path)))) {
-    const m = r.fields?.applet as { id?: unknown; name?: unknown; glyph?: unknown; note?: unknown } | undefined;
+    const m = r.fields?.applet as { id?: unknown; name?: unknown; glyph?: unknown } | undefined;
     const kind = codeKindOf(r.extension);
     if (!r.id || !r.path || !m || typeof m.id !== "string" || !ID.test(m.id) || m.id.length > 40 || typeof m.name !== "string" || !m.name.trim()) continue;
     if (!kind || typeof r.body !== "string" || importsComponents(r.body) || ids.has(m.id)) continue;
@@ -153,9 +155,11 @@ export async function approvedApplets(tools: readonly McpToolDef[], vaultName: s
     if (!ok.ok) continue;
     ids.add(m.id);
     out.push({
-      id: m.id, name: m.name.trim().slice(0, 60),
-      // the record's words go into Claude's tool list: short, one line
-      ...(typeof m.glyph === "string" ? { glyph: m.glyph.slice(0, 4) } : {}), ...(typeof m.note === "string" ? { note: m.note.replace(/\s+/g, " ").trim().slice(0, 160) } : {}),
+      // The name goes into Claude's tool list, and the approval's hash covers the code, not the record's fields: anyone
+      // who can write the vault can change them. So only the name goes, as one short line; no note (as a skill, an
+      // AI's instructions, takes an admin key: T-476 #160).
+      id: m.id, name: m.name.replace(/\s+/g, " ").trim().slice(0, 60),
+      ...(typeof m.glyph === "string" ? { glyph: m.glyph.slice(0, 4) } : {}),
       // its tags as the app reads them (REST lists a record's types among its tags)
       record: { id: r.id, path: r.path, extension: r.extension ?? kind, tags: [...new Set([...(r.tags ?? []), ...(r.types ?? [])])], fields: r.fields ?? {} },
       code: r.body, approval: ok.content,
@@ -171,14 +175,15 @@ export async function approvedApplets(tools: readonly McpToolDef[], vaultName: s
 export const appletUri = (id: string) => `${APPLET_URI_PREFIX}${id}`;
 
 /** What `open-<id>` answers: one line for the model; the view gets the rest as structuredContent. */
-export type OpenResult = { text: string; vault: string; applet: { id: string; name: string } };
+export type OpenResult = { text: string; vault: string; applet: { id: string } };
 
 export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { title: string; annotations: typeof READ; _meta: Record<string, unknown>; resultContent: (r: unknown) => { type: "text"; text: string }[]; resultStructured: (r: unknown) => Record<string, unknown> } {
   const uri = appletUri(a.id);
   return {
     name: `${OPEN_PREFIX}${a.id}`,
     title: a.name,
-    description: `Open ${a.name}, a Parachute applet in the ${vaultName} vault, as an interactive view${a.note ? `: ${a.note}` : "."} It reads and writes the vault itself; you get one line saying it opened.`,
+    // by its manifest id (letters, digits, dashes), not its name: the name is the tile's title, one short line
+    description: `Open the Parachute applet "${a.id}" in the ${vaultName} vault as an interactive view. It reads and writes the vault itself; you get one line saying it opened.`,
     inputSchema: { type: "object", properties: {} },
     requiredVerb: "read",
     // it opens a view and changes nothing itself
@@ -191,7 +196,7 @@ export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { t
       "ui/resourceUri": uri,
       "openai/ui": { entrypoints: [{ type: "global" }] },
     },
-    execute: async (): Promise<OpenResult> => ({ text: `Opened ${a.name} from the ${vaultName} vault.`, vault: vaultName, applet: { id: a.id, name: a.name } }),
+    execute: async (): Promise<OpenResult> => ({ text: `Opened the applet "${a.id}" from the ${vaultName} vault.`, vault: vaultName, applet: { id: a.id } }),
   } as never;
 }
 
